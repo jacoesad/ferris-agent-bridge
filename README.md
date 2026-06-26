@@ -26,6 +26,8 @@ chat message -> IM adapter -> core runtime -> agent adapter -> local CLI -> chat
 
 The design should keep IM adapters, agent adapters, and runtime policy separate so new platforms and agents can be added without rewriting the core.
 
+See [docs/architecture.md](docs/architecture.md) for architecture notes and [docs/roadmap.md](docs/roadmap.md) for the early `0.x` plan.
+
 ## Usage
 
 The current binary only exposes project metadata while the runtime is being designed:
