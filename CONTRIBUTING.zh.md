@@ -35,7 +35,11 @@ docs: add roadmap and contribution workflow
 
 ## 合并
 
-- 功能分支通过 merge commit 合并到 `main`，不使用 squash，以保留历史。
+- 功能分支通过 squash merging 合并到 `main`。
+- 仓库已配置为默认使用 PR 标题和描述作为 squash commit message。
+- PR 标题应按最终出现在 `main` 上的提交标题来写。
+- Squash commit 标题应总结 PR 结果，而不是逐条复述中间提交。
+- 需要详细实现说明时，放在 PR 描述中。
 - 合并前必须确认测试通过。
 
 ## Crate 布局
@@ -51,7 +55,7 @@ docs: add roadmap and contribution workflow
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
 - 如果存在 `release/*` 分支：在 `release/*` 分支中更新 `Cargo.toml` 版本和 `CHANGELOG.md`，然后再打 tag。
-- 如果不存在 `release/*` 分支，这也是单人维护时的默认流程：在 `feat/*` 分支中把版本和 `CHANGELOG.md` 作为最后一个提交更新，然后合并到 `main`。
+- 如果不存在 `release/*` 分支，这也是单人维护时的默认流程：在打开或合并 PR 前，把版本和 `CHANGELOG.md` 作为最后一项变更更新。
 
 通用规则：创建发布 tag 前，必须先确定版本信息。
 

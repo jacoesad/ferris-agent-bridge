@@ -35,7 +35,11 @@ docs: add roadmap and contribution workflow
 
 ## Merging
 
-- Feature branches are merged into `main` with a merge commit, not squashed, to preserve history.
+- Feature branches are merged into `main` with squash merging.
+- The repository is configured to use the PR title and description as the default squash commit message.
+- Write the PR title as the final commit title that should appear on `main`.
+- The squash commit title should summarize the PR outcome, not each intermediate commit.
+- Keep detailed implementation notes in the PR description when needed.
 - Always ensure tests pass before merging.
 
 ## Crate Layout
@@ -51,7 +55,7 @@ External SDK-style projects should normally stay as external dependencies. For e
 This project follows [Semantic Versioning](https://semver.org/).
 
 - If a `release/*` branch exists: update the `Cargo.toml` version and `CHANGELOG.md` in the `release/*` branch, just before tagging.
-- If no `release/*` branch exists, which is the default for single-contributor work: update the `Cargo.toml` version and `CHANGELOG.md` as the final commit in the `feat/*` branch, before merging into `main`.
+- If no `release/*` branch exists, which is the default for single-contributor work: update the `Cargo.toml` version and `CHANGELOG.md` as the final change before opening or merging the PR.
 
 General rule: version information must be finalized before a release tag is created.
 
