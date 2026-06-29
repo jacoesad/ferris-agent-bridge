@@ -38,6 +38,14 @@ docs: add roadmap and contribution workflow
 - Feature branches are merged into `main` with a merge commit, not squashed, to preserve history.
 - Always ensure tests pass before merging.
 
+## Crate Layout
+
+This project starts as a single crate. It may evolve into a Cargo workspace when internal boundaries become stable.
+
+Use `crates/` only for code with clear ownership, a focused public API, and independent tests. Prefer modules until those boundaries are proven.
+
+External SDK-style projects should normally stay as external dependencies. For example, a reusable Lark / Feishu channel SDK can be consumed by the Lark IM adapter instead of being copied into this repository.
+
 ## Versioning and Changelog
 
 This project follows [Semantic Versioning](https://semver.org/).
