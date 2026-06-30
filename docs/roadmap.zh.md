@@ -43,8 +43,8 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 包含：
 
-- `start`、`stop`、`status` CLI commands。
-- 便于调试的 foreground 或 development mode。
+- `run`、`start`、`stop`、`status` CLI commands。
+- 便于调试的 `run` foreground mode。
 - 本地状态的 runtime directory layout。
 - 防止重复服务实例的 atomic lock handling。
 - Stale lock detection 和 PID ownership validation。
@@ -62,7 +62,8 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 验收标准：
 
-- `ferris-agent-bridge start` 启动本地服务或 foreground runtime。
+- `ferris-agent-bridge run` 在前台运行本地 daemon。
+- `ferris-agent-bridge start` 启动本地后台服务。
 - `ferris-agent-bridge status` 报告服务是否运行。
 - `ferris-agent-bridge stop` 干净停止服务。
 - 重复 start 不会创建多个 active services。

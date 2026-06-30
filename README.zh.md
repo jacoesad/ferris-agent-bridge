@@ -37,13 +37,16 @@ chat message -> IM adapter -> core runtime -> agent adapter -> local CLI -> chat
 ```bash
 cargo run -- --help
 cargo run -- --version
+cargo run -- run
 cargo run -- start
-cargo run -- start --foreground
 cargo run -- status
 cargo run -- stop
 ```
 
 可以通过 `FERRIS_AGENT_BRIDGE_HOME` 覆盖默认 runtime 目录 `~/.ferris-agent-bridge`。
+
+`run` 会把 daemon loop 留在前台，方便开发和调试。
+`start` 当前会直接启动本地后台 daemon；后续加入 OS service 支持时，应继续保留这层语义拆分，由 `start` 管理平台 service wrapper。
 
 ## 非目标
 

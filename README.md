@@ -37,13 +37,16 @@ The current binary focuses on local daemon lifecycle commands:
 ```bash
 cargo run -- --help
 cargo run -- --version
+cargo run -- run
 cargo run -- start
-cargo run -- start --foreground
 cargo run -- status
 cargo run -- stop
 ```
 
 Set `FERRIS_AGENT_BRIDGE_HOME` to override the default runtime directory at `~/.ferris-agent-bridge`.
+
+`run` keeps the daemon loop in the foreground for development and debugging.
+`start` currently starts the local background daemon directly; future OS service support should keep the same split and let `start` manage the platform service wrapper.
 
 ## Non-Goals
 

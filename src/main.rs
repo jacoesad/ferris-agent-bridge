@@ -26,14 +26,13 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
         )),
         CliCommand::Help => Ok(help_text()),
         CliCommand::Version => Ok(format!("{NAME} {VERSION}")),
-        CliCommand::Start { foreground } => {
+        CliCommand::Run => {
             let paths = daemon::DaemonPaths::from_env()?;
-
-            if foreground {
-                daemon::start_foreground(&paths)
-            } else {
-                daemon::start_background(&paths)
-            }
+            daemon::run_foreground(&paths)
+        }
+        CliCommand::Start => {
+            let paths = daemon::DaemonPaths::from_env()?;
+            daemon::start_background(&paths)
         }
         CliCommand::Stop => {
             let paths = daemon::DaemonPaths::from_env()?;
@@ -56,9 +55,8 @@ enum CliCommand {
     About,
     Help,
     Version,
-    Start {
-        foreground: bool,
-    },
+    Run,
+    Start,
     Stop,
     Status,
     InternalDaemon {
@@ -73,7 +71,10 @@ fn parse_args(args: Vec<String>) -> Result<CliCommand, String> {
         [] => Ok(CliCommand::About),
         [flag] if flag == "--help" || flag == "-h" || flag == "help" => Ok(CliCommand::Help),
         [flag] if flag == "--version" || flag == "-V" => Ok(CliCommand::Version),
-        [command, rest @ ..] if command == "start" => parse_start_args(rest),
+        [command, rest @ ..] if command == "run" => parse_no_args(command, rest, CliCommand::Run),
+        [command, rest @ ..] if command == "start" => {
+            parse_no_args(command, rest, CliCommand::Start)
+        }
         [command, rest @ ..] if command == "stop" => parse_no_args(command, rest, CliCommand::Stop),
         [command, rest @ ..] if command == "status" => {
             parse_no_args(command, rest, CliCommand::Status)
@@ -131,23 +132,9 @@ fn parse_no_args(command: &str, args: &[String], parsed: CliCommand) -> Result<C
     }
 }
 
-fn parse_start_args(args: &[String]) -> Result<CliCommand, String> {
-    match args {
-        [] => Ok(CliCommand::Start { foreground: false }),
-        [flag] if flag == "--foreground" => Ok(CliCommand::Start { foreground: true }),
-        [flag] if flag == "--help" || flag == "-h" => Ok(CliCommand::Help),
-        [flag, unexpected, ..] if flag == "--foreground" => Err(format!(
-            "unexpected start argument: {unexpected}\n\nRun `{NAME} --help` for usage."
-        )),
-        [unknown, ..] => Err(format!(
-            "unknown start option: {unknown}\n\nRun `{NAME} --help` for usage."
-        )),
-    }
-}
-
 fn help_text() -> String {
     format!(
-        "{NAME} {VERSION}\n{DESCRIPTION}\n\nUSAGE:\n    {NAME} [OPTIONS]\n    {NAME} <COMMAND>\n\nCOMMANDS:\n    start      Start the local daemon\n    stop       Stop the local daemon\n    status     Show daemon status\n    help       Print help\n\nOPTIONS:\n    -h, --help       Print help\n    -V, --version    Print version\n\nSTART OPTIONS:\n        --foreground    Run the daemon in the foreground\n\nENV:\n    FERRIS_AGENT_BRIDGE_HOME    Override the local runtime directory"
+        "{NAME} {VERSION}\n{DESCRIPTION}\n\nUSAGE:\n    {NAME} [OPTIONS]\n    {NAME} <COMMAND>\n\nCOMMANDS:\n    run        Run the local daemon in the foreground\n    start      Start the local daemon in the background\n    stop       Stop the local daemon\n    status     Show daemon status\n    help       Print help\n\nOPTIONS:\n    -h, --help       Print help\n    -V, --version    Print version\n\nENV:\n    FERRIS_AGENT_BRIDGE_HOME    Override the local runtime directory"
     )
 }
 
@@ -160,6 +147,7 @@ mod tests {
         let output = run(["--help".to_owned()]).expect("help should succeed");
         assert!(output.contains("USAGE:"));
         assert!(output.contains("--version"));
+        assert!(output.contains("run"));
         assert!(output.contains("start"));
     }
 
@@ -185,25 +173,24 @@ mod tests {
             parse_args(vec!["status".to_owned(), "json".to_owned()]).expect_err("status arg fails");
         assert!(status_err.contains("unexpected status argument: json"));
 
-        let foreground_err = parse_args(vec![
-            "start".to_owned(),
-            "--foreground".to_owned(),
-            "extra".to_owned(),
-        ])
-        .expect_err("foreground extra arg fails");
-        assert!(foreground_err.contains("unexpected start argument: extra"));
+        let run_err =
+            parse_args(vec!["run".to_owned(), "now".to_owned()]).expect_err("run extra arg fails");
+        assert!(run_err.contains("unexpected run argument: now"));
+
+        let start_err = parse_args(vec!["start".to_owned(), "--foreground".to_owned()])
+            .expect_err("start arg fails");
+        assert!(start_err.contains("unexpected start argument: --foreground"));
     }
 
     #[test]
     fn parses_daemon_commands() {
         assert_eq!(
-            parse_args(vec!["start".to_owned()]).expect("start should parse"),
-            CliCommand::Start { foreground: false }
+            parse_args(vec!["run".to_owned()]).expect("run should parse"),
+            CliCommand::Run
         );
         assert_eq!(
-            parse_args(vec!["start".to_owned(), "--foreground".to_owned()])
-                .expect("foreground start should parse"),
-            CliCommand::Start { foreground: true }
+            parse_args(vec!["start".to_owned()]).expect("start should parse"),
+            CliCommand::Start
         );
         assert_eq!(
             parse_args(vec!["stop".to_owned()]).expect("stop should parse"),

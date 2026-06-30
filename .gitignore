@@ -16,6 +16,7 @@ Thumbs.db
 # Logs and local state
 *.log
 /.ferris-agent-bridge/
+/tmp/
 
 # Environment files
 .env

@@ -113,7 +113,7 @@ fn runtime_directory_and_files_are_private() {
 fn foreground_daemon_can_be_stopped_from_another_command() {
     let runtime = RuntimeDir::new();
     let mut child = Command::new(&runtime.bin)
-        .args(["start", "--foreground"])
+        .arg("run")
         .env(HOME_ENV, &runtime.path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

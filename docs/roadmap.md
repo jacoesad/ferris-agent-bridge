@@ -43,8 +43,8 @@ Design note: [0.1 Daemon Lifecycle Design](design/0.1-daemon-lifecycle.md).
 
 Included:
 
-- `start`, `stop`, and `status` CLI commands.
-- Foreground or development mode for easier debugging.
+- `run`, `start`, `stop`, and `status` CLI commands.
+- `run` foreground mode for easier debugging.
 - Runtime directory layout for local state.
 - Atomic lock handling to prevent duplicate service instances.
 - Stale lock detection and PID ownership validation.
@@ -62,7 +62,8 @@ Not included:
 
 Acceptance criteria:
 
-- `ferris-agent-bridge start` starts a local service or foreground runtime.
+- `ferris-agent-bridge run` runs the local daemon in the foreground.
+- `ferris-agent-bridge start` starts a local background service.
 - `ferris-agent-bridge status` reports whether the service is running.
 - `ferris-agent-bridge stop` stops the service cleanly.
 - Repeated starts do not create duplicate active services.

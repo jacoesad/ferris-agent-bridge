@@ -217,7 +217,7 @@ pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
     ))
 }
 
-pub fn start_foreground(paths: &DaemonPaths) -> Result<String, String> {
+pub fn run_foreground(paths: &DaemonPaths) -> Result<String, String> {
     let (token, lifecycle_lock) = match prepare_start(paths)? {
         StartPreparation::AlreadyRunning(record) => {
             return Ok(already_running_text(paths, &record));
@@ -252,7 +252,7 @@ pub fn start_foreground(paths: &DaemonPaths) -> Result<String, String> {
         Ok(child) => child,
         Err(err) => {
             cleanup_runtime_files_for_token_unlocked(paths, &token);
-            return Err(format!("failed to start foreground daemon: {err}"));
+            return Err(format!("failed to run foreground daemon: {err}"));
         }
     };
     drop(lifecycle_lock);
