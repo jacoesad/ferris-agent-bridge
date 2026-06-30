@@ -168,29 +168,15 @@ impl DaemonRecord {
 }
 
 pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
-    prepare_runtime_dir(paths)?;
-    let lifecycle_lock = acquire_lifecycle_lock(paths)
-        .map_err(|err| format!("failed to acquire daemon lifecycle lock: {err}"))?;
-
-    match inspect_status(paths) {
-        DaemonStatus::Running(record) | DaemonStatus::RunningUnverified { record, .. } => {
-            return Ok(format!(
-                "{NAME} daemon is already running.\npid: {}\nruntime dir: {}",
-                record.pid,
-                paths.runtime_dir.display()
-            ));
+    let (token, lifecycle_lock) = match prepare_start(paths)? {
+        StartPreparation::AlreadyRunning(record) => {
+            return Ok(already_running_text(paths, &record));
         }
-        DaemonStatus::Unowned { pid, reason } => {
-            return Err(format!(
-                "refusing to start: recorded pid {pid} is not owned by this daemon ({reason})"
-            ));
-        }
-        DaemonStatus::Stale { record, .. } => cleanup_stale_files_unlocked(paths, record.as_ref()),
-        DaemonStatus::Stopped => {}
-    }
-
-    let token = generate_token();
-    acquire_start_lock(paths, token.clone())?;
+        StartPreparation::Ready {
+            token,
+            lifecycle_lock,
+        } => (token, lifecycle_lock),
+    };
 
     let exe =
         env::current_exe().map_err(|err| format!("failed to locate current executable: {err}"))?;
@@ -221,10 +207,7 @@ pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
     };
     drop(lifecycle_lock);
 
-    if let Err(err) = wait_for_running(paths, child.id(), &token) {
-        cleanup_failed_start(paths, &mut child, &token);
-        return Err(err);
-    }
+    wait_for_start_ready(paths, &mut child, &token)?;
 
     Ok(format!(
         "{NAME} daemon started.\npid: {}\nruntime dir: {}\nlog: {}",
@@ -235,29 +218,15 @@ pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
 }
 
 pub fn start_foreground(paths: &DaemonPaths) -> Result<String, String> {
-    prepare_runtime_dir(paths)?;
-    let lifecycle_lock = acquire_lifecycle_lock(paths)
-        .map_err(|err| format!("failed to acquire daemon lifecycle lock: {err}"))?;
-
-    match inspect_status(paths) {
-        DaemonStatus::Running(record) | DaemonStatus::RunningUnverified { record, .. } => {
-            return Ok(format!(
-                "{NAME} daemon is already running.\npid: {}\nruntime dir: {}",
-                record.pid,
-                paths.runtime_dir.display()
-            ));
+    let (token, lifecycle_lock) = match prepare_start(paths)? {
+        StartPreparation::AlreadyRunning(record) => {
+            return Ok(already_running_text(paths, &record));
         }
-        DaemonStatus::Unowned { pid, reason } => {
-            return Err(format!(
-                "refusing to start: recorded pid {pid} is not owned by this daemon ({reason})"
-            ));
-        }
-        DaemonStatus::Stale { record, .. } => cleanup_stale_files_unlocked(paths, record.as_ref()),
-        DaemonStatus::Stopped => {}
-    }
-
-    let token = generate_token();
-    acquire_start_lock(paths, token.clone())?;
+        StartPreparation::Ready {
+            token,
+            lifecycle_lock,
+        } => (token, lifecycle_lock),
+    };
 
     let exe =
         env::current_exe().map_err(|err| format!("failed to locate current executable: {err}"))?;
@@ -288,10 +257,7 @@ pub fn start_foreground(paths: &DaemonPaths) -> Result<String, String> {
     };
     drop(lifecycle_lock);
 
-    if let Err(err) = wait_for_running(paths, child.id(), &token) {
-        cleanup_failed_start(paths, &mut child, &token);
-        return Err(err);
-    }
+    wait_for_start_ready(paths, &mut child, &token)?;
 
     let status = child
         .wait()
@@ -303,6 +269,49 @@ pub fn start_foreground(paths: &DaemonPaths) -> Result<String, String> {
     }
 
     Ok(format!("{NAME} daemon stopped."))
+}
+
+enum StartPreparation {
+    AlreadyRunning(DaemonRecord),
+    Ready {
+        token: String,
+        lifecycle_lock: LifecycleLockGuard,
+    },
+}
+
+fn prepare_start(paths: &DaemonPaths) -> Result<StartPreparation, String> {
+    prepare_runtime_dir(paths)?;
+    let lifecycle_lock = acquire_lifecycle_lock(paths)
+        .map_err(|err| format!("failed to acquire daemon lifecycle lock: {err}"))?;
+
+    match inspect_status(paths) {
+        DaemonStatus::Running(record) | DaemonStatus::RunningUnverified { record, .. } => {
+            return Ok(StartPreparation::AlreadyRunning(record));
+        }
+        DaemonStatus::Unowned { pid, reason } => {
+            return Err(format!(
+                "refusing to start: recorded pid {pid} is not owned by this daemon ({reason})"
+            ));
+        }
+        DaemonStatus::Stale { record, .. } => cleanup_stale_files_unlocked(paths, record.as_ref()),
+        DaemonStatus::Stopped => {}
+    }
+
+    let token = generate_token();
+    acquire_start_lock(paths, token.clone())?;
+
+    Ok(StartPreparation::Ready {
+        token,
+        lifecycle_lock,
+    })
+}
+
+fn already_running_text(paths: &DaemonPaths, record: &DaemonRecord) -> String {
+    format!(
+        "{NAME} daemon is already running.\npid: {}\nruntime dir: {}",
+        record.pid,
+        paths.runtime_dir.display()
+    )
 }
 
 pub fn status_text(paths: &DaemonPaths) -> String {
@@ -460,6 +469,15 @@ fn inspect_status(paths: &DaemonPaths) -> DaemonStatus {
             reason: "process command line does not match daemon token or mode".to_owned(),
         },
     }
+}
+
+fn wait_for_start_ready(paths: &DaemonPaths, child: &mut Child, token: &str) -> Result<(), String> {
+    if let Err(err) = wait_for_running(paths, child.id(), token) {
+        cleanup_failed_start(paths, child, token);
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn wait_for_running(paths: &DaemonPaths, pid: u32, token: &str) -> Result<(), String> {

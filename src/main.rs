@@ -74,8 +74,10 @@ fn parse_args(args: Vec<String>) -> Result<CliCommand, String> {
         [flag] if flag == "--help" || flag == "-h" || flag == "help" => Ok(CliCommand::Help),
         [flag] if flag == "--version" || flag == "-V" => Ok(CliCommand::Version),
         [command, rest @ ..] if command == "start" => parse_start_args(rest),
-        [command] if command == "stop" => Ok(CliCommand::Stop),
-        [command] if command == "status" => Ok(CliCommand::Status),
+        [command, rest @ ..] if command == "stop" => parse_no_args(command, rest, CliCommand::Stop),
+        [command, rest @ ..] if command == "status" => {
+            parse_no_args(command, rest, CliCommand::Status)
+        }
         [command, token_flag, token, starter_flag, starter_pid]
             if command == "__daemon"
                 && token_flag == "--token"
@@ -120,11 +122,23 @@ fn parse_starter_pid(value: &str) -> Result<u32, String> {
         .map_err(|err| format!("invalid internal daemon starter pid `{value}`: {err}"))
 }
 
+fn parse_no_args(command: &str, args: &[String], parsed: CliCommand) -> Result<CliCommand, String> {
+    match args {
+        [] => Ok(parsed),
+        [unexpected, ..] => Err(format!(
+            "unexpected {command} argument: {unexpected}\n\nRun `{NAME} --help` for usage."
+        )),
+    }
+}
+
 fn parse_start_args(args: &[String]) -> Result<CliCommand, String> {
     match args {
         [] => Ok(CliCommand::Start { foreground: false }),
         [flag] if flag == "--foreground" => Ok(CliCommand::Start { foreground: true }),
         [flag] if flag == "--help" || flag == "-h" => Ok(CliCommand::Help),
+        [flag, unexpected, ..] if flag == "--foreground" => Err(format!(
+            "unexpected start argument: {unexpected}\n\nRun `{NAME} --help` for usage."
+        )),
         [unknown, ..] => Err(format!(
             "unknown start option: {unknown}\n\nRun `{NAME} --help` for usage."
         )),
@@ -159,6 +173,25 @@ mod tests {
     fn rejects_unknown_arguments() {
         let err = run(["unknown".to_owned()]).expect_err("unknown command should fail");
         assert!(err.contains("unknown command: unknown"));
+    }
+
+    #[test]
+    fn rejects_trailing_command_arguments() {
+        let stop_err =
+            parse_args(vec!["stop".to_owned(), "now".to_owned()]).expect_err("stop arg fails");
+        assert!(stop_err.contains("unexpected stop argument: now"));
+
+        let status_err =
+            parse_args(vec!["status".to_owned(), "json".to_owned()]).expect_err("status arg fails");
+        assert!(status_err.contains("unexpected status argument: json"));
+
+        let foreground_err = parse_args(vec![
+            "start".to_owned(),
+            "--foreground".to_owned(),
+            "extra".to_owned(),
+        ])
+        .expect_err("foreground extra arg fails");
+        assert!(foreground_err.contains("unexpected start argument: extra"));
     }
 
     #[test]
