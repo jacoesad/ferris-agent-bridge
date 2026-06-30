@@ -39,6 +39,8 @@ Goal:
 
 Provide a usable local service foundation with basic lifecycle commands. This version should prove that the project can manage a local background process safely before it connects to chat platforms or real agent CLIs.
 
+Design note: [0.1 Daemon Lifecycle Design](design/0.1-daemon-lifecycle.md).
+
 Included:
 
 - `start`, `stop`, and `status` CLI commands.

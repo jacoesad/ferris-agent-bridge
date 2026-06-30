@@ -39,6 +39,8 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 提供可用的本地服务基础和基本 lifecycle commands。这个版本应证明项目可以安全管理本地后台进程，然后再连接 chat platforms 或真实 agent CLIs。
 
+设计说明：[0.1 Daemon 生命周期设计](design/0.1-daemon-lifecycle.zh.md)。
+
 包含：
 
 - `start`、`stop`、`status` CLI commands。
