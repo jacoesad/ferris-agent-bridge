@@ -320,7 +320,7 @@ fn prepare_start(paths: &DaemonPaths) -> Result<StartPreparation, String> {
     match inspect_status(paths) {
         DaemonStatus::Starting(record) => {
             return Err(format!(
-                "refusing to start: daemon startup is already in progress by pid {}",
+                "refusing to start: daemon start is already in progress by pid {}",
                 record.pid
             ));
         }
@@ -953,8 +953,8 @@ fn acquire_lifecycle_lock(paths: &DaemonPaths) -> io::Result<LifecycleLockGuard>
                         let _ = remove_lifecycle_lock_if_matches(&lock_file, &token);
                         continue;
                     }
-                    StaleLifecycleLock::Incomplete => {
-                        cleanup_incomplete_lifecycle_lock(&lock_file);
+                    StaleLifecycleLock::Incomplete(snapshot) => {
+                        let _ = cleanup_incomplete_lifecycle_lock_if_matches(&lock_file, &snapshot);
                         continue;
                     }
                     StaleLifecycleLock::NotStale => {}
@@ -990,7 +990,7 @@ fn create_lifecycle_lock(path: &Path) -> io::Result<LifecycleLockGuard> {
         .and_then(|()| set_private_file_permissions(path));
 
     if let Err(err) = result {
-        cleanup_incomplete_lifecycle_lock(path);
+        let _ = remove_file_if_exists(path);
         return Err(err);
     }
 
@@ -998,10 +998,6 @@ fn create_lifecycle_lock(path: &Path) -> io::Result<LifecycleLockGuard> {
         lock_file: path.to_owned(),
         token,
     })
-}
-
-fn cleanup_incomplete_lifecycle_lock(path: &Path) {
-    let _ = remove_file_if_exists(path);
 }
 
 fn lifecycle_lock_contents(token: &str) -> String {
@@ -1016,25 +1012,96 @@ fn lifecycle_lock_contents(token: &str) -> String {
 enum StaleLifecycleLock {
     NotStale,
     Owned(String),
-    Incomplete,
+    Incomplete(FileSnapshot),
 }
 
 fn inspect_stale_lifecycle_lock(path: &Path) -> StaleLifecycleLock {
-    let is_stale = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .map(|elapsed| elapsed > LIFECYCLE_LOCK_STALE_TTL)
-        .unwrap_or(false);
+    let snapshot = match FileSnapshot::from_path(path) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) | Err(_) => return StaleLifecycleLock::NotStale,
+    };
 
-    if !is_stale {
+    if !snapshot.is_stale() {
         return StaleLifecycleLock::NotStale;
     }
 
     match read_lifecycle_lock_token(path) {
         Ok(Some(token)) => StaleLifecycleLock::Owned(token),
-        Ok(None) | Err(_) => StaleLifecycleLock::Incomplete,
+        Ok(None) | Err(_) => StaleLifecycleLock::Incomplete(snapshot),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileSnapshot {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileSnapshot {
+    fn from_path(path: &Path) -> io::Result<Option<Self>> {
+        match fs::metadata(path) {
+            Ok(metadata) => Self::from_metadata(metadata).map(Some),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn from_metadata(metadata: fs::Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified()?,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                len: metadata.len(),
+                modified: metadata.modified()?,
+            })
+        }
+    }
+
+    fn is_stale(&self) -> bool {
+        self.modified
+            .elapsed()
+            .map(|elapsed| elapsed > LIFECYCLE_LOCK_STALE_TTL)
+            .unwrap_or(false)
+    }
+
+    fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        Ok(Self::from_path(path)?.as_ref() == Some(self))
+    }
+}
+
+fn cleanup_incomplete_lifecycle_lock_if_matches(
+    path: &Path,
+    expected: &FileSnapshot,
+) -> io::Result<bool> {
+    if !expected.matches_path(path)? || !expected.is_stale() {
+        return Ok(false);
+    }
+
+    if read_lifecycle_lock_token(path)?.is_some() {
+        return Ok(false);
+    }
+
+    if !expected.matches_path(path)? {
+        return Ok(false);
+    }
+
+    remove_file_if_exists(path)?;
+    Ok(true)
 }
 
 fn read_lifecycle_lock_token(path: &Path) -> io::Result<Option<String>> {
@@ -1642,16 +1709,52 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_lifecycle_lock_cleanup_removes_tokenless_file() {
+    #[cfg(unix)]
+    fn incomplete_lifecycle_lock_cleanup_removes_matching_tokenless_file() {
         let dir = temp_test_dir("incomplete-lifecycle-lock");
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
         fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        mark_file_stale(&lock_file);
+        let snapshot = FileSnapshot::from_path(&lock_file)
+            .expect("snapshot should read")
+            .expect("snapshot should exist");
 
-        cleanup_incomplete_lifecycle_lock(&lock_file);
+        let removed = cleanup_incomplete_lifecycle_lock_if_matches(&lock_file, &snapshot)
+            .expect("cleanup should succeed");
 
+        assert!(removed);
         assert!(!lock_file.exists());
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incomplete_lifecycle_lock_cleanup_does_not_remove_replaced_lock() {
+        let dir = temp_test_dir("incomplete-lifecycle-lock-replaced");
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        mark_file_stale(&lock_file);
+        let old_snapshot = FileSnapshot::from_path(&lock_file)
+            .expect("snapshot should read")
+            .expect("snapshot should exist");
+
+        remove_file_if_exists(&lock_file).expect("old lock should be removed");
+        let new_guard = create_lifecycle_lock(&lock_file).expect("new lock should be created");
+        let new_token = new_guard.token.clone();
+
+        let removed = cleanup_incomplete_lifecycle_lock_if_matches(&lock_file, &old_snapshot)
+            .expect("cleanup should succeed");
+
+        assert!(!removed);
+        assert_eq!(
+            read_lifecycle_lock_token(&lock_file).expect("lock token should read"),
+            Some(new_token)
+        );
+
+        drop(new_guard);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1664,12 +1767,7 @@ mod tests {
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
         fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
 
-        let status = Command::new("touch")
-            .args(["-t", "197001010000"])
-            .arg(&lock_file)
-            .status()
-            .expect("touch should run");
-        assert!(status.success(), "touch should mark lock as stale");
+        mark_file_stale(&lock_file);
 
         let guard = acquire_lifecycle_lock(&paths).expect("stale tokenless lock should recover");
 
@@ -1815,5 +1913,15 @@ mod tests {
             process::id(),
             generate_token()
         ))
+    }
+
+    #[cfg(unix)]
+    fn mark_file_stale(path: &Path) {
+        let status = Command::new("touch")
+            .args(["-t", "197001010000"])
+            .arg(path)
+            .status()
+            .expect("touch should run");
+        assert!(status.success(), "touch should mark file as stale");
     }
 }
