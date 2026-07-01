@@ -1,12 +1,14 @@
 # ferris-agent-bridge
 
+[English](README.md) | [简体中文](README.zh.md)
+
 A Rust-first bridge for local AI agents to chat platforms.
 
 `ferris-agent-bridge` is an early-stage, from-scratch project for running local agent CLIs from chat while keeping execution on the user's machine. It is intended to work as a local relay service managed by a CLI.
 
 ## Status
 
-🚧 Early development. Version `0.0.1` provides a minimal Rust binary; the core runtime and adapter interfaces are being designed.
+🚧 Early development. The published `0.0.1` release provides a minimal Rust binary. The current development branch provides local daemon lifecycle commands before runtime and adapter integration.
 
 ## Goals
 
@@ -30,12 +32,21 @@ See [docs/architecture.md](docs/architecture.md) for architecture notes and [doc
 
 ## Usage
 
-The current binary only exposes project metadata while the runtime is being designed:
+The current binary focuses on local daemon lifecycle commands:
 
 ```bash
 cargo run -- --help
 cargo run -- --version
+cargo run -- run
+cargo run -- start
+cargo run -- status
+cargo run -- stop
 ```
+
+Set `FERRIS_AGENT_BRIDGE_HOME` to override the default runtime directory at `~/.ferris-agent-bridge`.
+
+`run` keeps the daemon loop in the foreground for development and debugging.
+`start` currently starts the local background daemon directly; future OS service support should keep the same split and let `start` manage the platform service wrapper.
 
 ## Non-Goals
 
