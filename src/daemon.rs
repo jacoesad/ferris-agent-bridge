@@ -150,8 +150,8 @@ impl DaemonRecord {
                             .map_err(|err| format!("invalid pid `{value}`: {err}"))?,
                     );
                 }
-                "token" => token = Some(value.to_owned()),
-                "exe" => exe = Some(value.to_owned()),
+                "token" => token = Some(non_empty_record_value("token", value)?),
+                "exe" => exe = Some(non_empty_record_value("exe", value)?),
                 "started_at_unix" => {
                     started_at_unix = Some(
                         value
@@ -159,7 +159,13 @@ impl DaemonRecord {
                             .map_err(|err| format!("invalid started_at_unix `{value}`: {err}"))?,
                     );
                 }
-                "mode" => mode = Some(value.to_owned()),
+                "mode" => {
+                    let value = non_empty_record_value("mode", value)?;
+                    if !is_known_mode(&value) {
+                        return Err(format!("invalid mode `{value}`"));
+                    }
+                    mode = Some(value);
+                }
                 _ => {}
             }
         }
@@ -172,6 +178,18 @@ impl DaemonRecord {
             mode: mode.ok_or_else(|| "missing mode".to_owned())?,
         })
     }
+}
+
+fn non_empty_record_value(key: &str, value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("empty {key}"));
+    }
+
+    Ok(value.to_owned())
+}
+
+fn is_known_mode(value: &str) -> bool {
+    matches!(value, MODE_STARTING | MODE_BACKGROUND | MODE_FOREGROUND)
 }
 
 pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
@@ -1025,10 +1043,35 @@ fn inspect_stale_lifecycle_lock(path: &Path) -> StaleLifecycleLock {
         return StaleLifecycleLock::NotStale;
     }
 
-    match read_lifecycle_lock_token(path) {
-        Ok(Some(token)) => StaleLifecycleLock::Owned(token),
+    match read_lifecycle_lock(path) {
+        Ok(Some(LifecycleLockContent::Complete(record))) => {
+            if is_process_running(record.pid) {
+                StaleLifecycleLock::NotStale
+            } else {
+                StaleLifecycleLock::Owned(record.token)
+            }
+        }
+        Ok(Some(LifecycleLockContent::Incomplete { pid })) => {
+            if pid.map(is_process_running).unwrap_or(false) {
+                StaleLifecycleLock::NotStale
+            } else {
+                StaleLifecycleLock::Incomplete(snapshot)
+            }
+        }
         Ok(None) | Err(_) => StaleLifecycleLock::Incomplete(snapshot),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleLockRecord {
+    pid: u32,
+    token: String,
+    _started_at_unix: u64,
+}
+
+enum LifecycleLockContent {
+    Complete(LifecycleLockRecord),
+    Incomplete { pid: Option<u32> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1092,8 +1135,14 @@ fn cleanup_incomplete_lifecycle_lock_if_matches(
         return Ok(false);
     }
 
-    if read_lifecycle_lock_token(path)?.is_some() {
-        return Ok(false);
+    match read_lifecycle_lock(path)? {
+        Some(LifecycleLockContent::Complete(_)) => return Ok(false),
+        Some(LifecycleLockContent::Incomplete { pid })
+            if pid.map(is_process_running).unwrap_or(false) =>
+        {
+            return Ok(false);
+        }
+        Some(LifecycleLockContent::Incomplete { .. }) | None => {}
     }
 
     if !expected.matches_path(path)? {
@@ -1104,24 +1153,67 @@ fn cleanup_incomplete_lifecycle_lock_if_matches(
     Ok(true)
 }
 
-fn read_lifecycle_lock_token(path: &Path) -> io::Result<Option<String>> {
+fn read_lifecycle_lock(path: &Path) -> io::Result<Option<LifecycleLockContent>> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
 
-    Ok(content.lines().find_map(|line| {
-        line.strip_prefix("token=")
-            .filter(|token| !token.is_empty())
-            .map(str::to_owned)
-    }))
+    Ok(Some(parse_lifecycle_lock_content(&content)))
+}
+
+fn parse_lifecycle_lock_content(input: &str) -> LifecycleLockContent {
+    let mut pid = None;
+    let mut token = None;
+    let mut started_at_unix = None;
+
+    for line in input.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        match key {
+            "pid" => {
+                if let Ok(value) = value.parse::<u32>() {
+                    pid = Some(value);
+                }
+            }
+            "token" => token = Some(value.to_owned()),
+            "started_at_unix" => {
+                if let Ok(value) = value.parse::<u64>() {
+                    started_at_unix = Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match (pid, token, started_at_unix) {
+        (Some(pid), Some(token), Some(started_at_unix)) if !token.is_empty() => {
+            LifecycleLockContent::Complete(LifecycleLockRecord {
+                pid,
+                token,
+                _started_at_unix: started_at_unix,
+            })
+        }
+        (pid, _, _) => LifecycleLockContent::Incomplete { pid },
+    }
+}
+
+#[cfg(test)]
+fn read_lifecycle_lock_token(path: &Path) -> io::Result<Option<String>> {
+    Ok(match read_lifecycle_lock(path)? {
+        Some(LifecycleLockContent::Complete(record)) => Some(record.token),
+        Some(LifecycleLockContent::Incomplete { .. }) | None => None,
+    })
 }
 
 fn remove_lifecycle_lock_if_matches(path: &Path, token: &str) -> io::Result<bool> {
-    let should_remove = read_lifecycle_lock_token(path)?
-        .map(|current| current == token)
-        .unwrap_or(false);
+    let should_remove = matches!(
+        read_lifecycle_lock(path)?,
+        Some(LifecycleLockContent::Complete(record)) if record.token == token
+    );
 
     if should_remove {
         remove_file_if_exists(path)?;
@@ -1466,6 +1558,21 @@ mod tests {
     }
 
     #[test]
+    fn record_decode_rejects_empty_identity_fields() {
+        for input in [
+            "pid=1\ntoken=\nexe=/tmp/fab\nstarted_at_unix=1\nmode=background\n",
+            "pid=1\ntoken=token\nexe=\nstarted_at_unix=1\nmode=background\n",
+            "pid=1\ntoken=token\nexe=/tmp/fab\nstarted_at_unix=1\nmode=\n",
+            "pid=1\ntoken=token\nexe=/tmp/fab\nstarted_at_unix=1\nmode=other\n",
+        ] {
+            assert!(
+                DaemonRecord::decode(input).is_err(),
+                "record should reject invalid input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn lifecycle_timeout_budget_allows_stale_recovery() {
         assert!(
             LIFECYCLE_LOCK_STALE_TTL > STOP_TIMEOUT + STOP_TIMEOUT,
@@ -1710,6 +1817,53 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn stale_lifecycle_lock_with_live_pid_is_not_recovered() {
+        let dir = temp_test_dir("live-stale-lifecycle-lock");
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+        fs::write(&lock_file, lifecycle_lock_contents("live-token"))
+            .expect("lock should be written");
+        mark_file_stale(&lock_file);
+
+        assert!(matches!(
+            inspect_stale_lifecycle_lock(&lock_file),
+            StaleLifecycleLock::NotStale
+        ));
+        assert_eq!(
+            read_lifecycle_lock_token(&lock_file).expect("lock token should read"),
+            Some("live-token".to_owned())
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquire_lifecycle_lock_recovers_complete_dead_stale_lock() {
+        let dir = temp_test_dir("dead-stale-lifecycle-lock");
+        let paths = DaemonPaths::new(&dir);
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+        fs::write(
+            &lock_file,
+            format!("pid={}\ntoken=dead-token\nstarted_at_unix=1\n", u32::MAX),
+        )
+        .expect("lock should be written");
+        mark_file_stale(&lock_file);
+
+        let guard = acquire_lifecycle_lock(&paths).expect("dead stale lock should recover");
+
+        assert_eq!(
+            read_lifecycle_lock_token(&lock_file).expect("lock token should read"),
+            Some(guard.token.clone())
+        );
+
+        drop(guard);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn incomplete_lifecycle_lock_cleanup_removes_matching_tokenless_file() {
         let dir = temp_test_dir("incomplete-lifecycle-lock");
         fs::create_dir_all(&dir).expect("test dir should be created");
@@ -1725,6 +1879,28 @@ mod tests {
 
         assert!(removed);
         assert!(!lock_file.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incomplete_lifecycle_lock_cleanup_does_not_remove_live_owner() {
+        let dir = temp_test_dir("incomplete-lifecycle-lock-live");
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+        fs::write(&lock_file, format!("pid={}\n", process::id()))
+            .expect("incomplete lock should be written");
+        mark_file_stale(&lock_file);
+        let snapshot = FileSnapshot::from_path(&lock_file)
+            .expect("snapshot should read")
+            .expect("snapshot should exist");
+
+        let removed = cleanup_incomplete_lifecycle_lock_if_matches(&lock_file, &snapshot)
+            .expect("cleanup should succeed");
+
+        assert!(!removed);
+        assert!(lock_file.exists());
 
         let _ = fs::remove_dir_all(dir);
     }
