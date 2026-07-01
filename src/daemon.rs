@@ -85,6 +85,7 @@ fn non_empty_env(name: &str) -> Option<OsString> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonStatus {
+    Starting(DaemonRecord),
     Running(DaemonRecord),
     RunningUnverified {
         record: DaemonRecord,
@@ -317,6 +318,12 @@ fn prepare_start(paths: &DaemonPaths) -> Result<StartPreparation, String> {
         .map_err(|err| format!("failed to acquire daemon lifecycle lock: {err}"))?;
 
     match inspect_status(paths) {
+        DaemonStatus::Starting(record) => {
+            return Err(format!(
+                "refusing to start: daemon startup is already in progress by pid {}",
+                record.pid
+            ));
+        }
         DaemonStatus::Running(record) | DaemonStatus::RunningUnverified { record, .. } => {
             return Ok(StartPreparation::AlreadyRunning(record));
         }
@@ -348,6 +355,12 @@ fn already_running_text(paths: &DaemonPaths, record: &DaemonRecord) -> String {
 
 pub fn status_text(paths: &DaemonPaths) -> String {
     match inspect_status(paths) {
+        DaemonStatus::Starting(record) => format!(
+            "{NAME} daemon is starting.\nstarter_pid: {}\nstarted_at_unix: {}\nruntime dir: {}",
+            record.pid,
+            record.started_at_unix,
+            paths.runtime_dir.display()
+        ),
         DaemonStatus::Running(record) => format!(
             "{NAME} daemon is running.\npid: {}\nstarted_at_unix: {}\nruntime dir: {}\nlog: {}",
             record.pid,
@@ -391,6 +404,10 @@ pub fn stop(paths: &DaemonPaths) -> Result<String, String> {
         .map_err(|err| format!("failed to acquire daemon lifecycle lock: {err}"))?;
 
     match inspect_status(paths) {
+        DaemonStatus::Starting(record) => Err(format!(
+            "refusing to stop daemon while startup is in progress by pid {}; try again shortly",
+            record.pid
+        )),
         DaemonStatus::Running(record) => {
             let stopped = request_graceful_stop(paths, &record)?;
 
@@ -473,18 +490,65 @@ fn run_daemon(
 }
 
 fn inspect_status(paths: &DaemonPaths) -> DaemonStatus {
-    let record = match read_record(&paths.state_file) {
+    match read_record(&paths.state_file) {
+        Ok(Some(record)) => inspect_record_status(record),
+        Ok(None) => inspect_lock_without_state(paths, "daemon state is missing"),
+        Err(reason) => {
+            inspect_lock_without_state(paths, format!("daemon state is invalid: {reason}"))
+        }
+    }
+}
+
+fn inspect_lock_without_state(
+    paths: &DaemonPaths,
+    state_reason: impl Into<String>,
+) -> DaemonStatus {
+    let state_reason = state_reason.into();
+    let record = match read_record(&paths.lock_file) {
         Ok(Some(record)) => record,
-        Ok(None) => return DaemonStatus::Stopped,
+        Ok(None) if state_reason == "daemon state is missing" => return DaemonStatus::Stopped,
+        Ok(None) => {
+            return DaemonStatus::Stale {
+                pid: None,
+                record: None,
+                reason: state_reason,
+            };
+        }
         Err(reason) => {
             return DaemonStatus::Stale {
                 pid: None,
                 record: None,
-                reason,
+                reason: format!("{state_reason}; daemon lock is invalid: {reason}"),
             };
         }
     };
 
+    if record.mode == MODE_STARTING {
+        if is_process_running(record.pid) {
+            return DaemonStatus::Starting(record);
+        }
+
+        return DaemonStatus::Stale {
+            pid: Some(record.pid),
+            record: Some(record),
+            reason: format!("{state_reason}; startup lock holder is not running"),
+        };
+    }
+
+    match inspect_record_status(record) {
+        DaemonStatus::Running(record) => DaemonStatus::RunningUnverified {
+            record,
+            reason: state_reason,
+        },
+        DaemonStatus::RunningUnverified { record, reason } => DaemonStatus::RunningUnverified {
+            record,
+            reason: format!("{state_reason}; {reason}"),
+        },
+        other => other,
+    }
+}
+
+fn inspect_record_status(record: DaemonRecord) -> DaemonStatus {
     if !is_process_running(record.pid) {
         return DaemonStatus::Stale {
             pid: Some(record.pid),
@@ -648,7 +712,6 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
 }
 
 fn cleanup_failed_start(paths: &DaemonPaths, child: &mut Child, token: &str) {
-    let lifecycle_lock = acquire_lifecycle_lock(paths).ok();
     let _ = write_private_file(&paths.stop_file, token);
 
     if !wait_for_child_exit(child, START_FAILURE_STOP_TIMEOUT) {
@@ -656,10 +719,8 @@ fn cleanup_failed_start(paths: &DaemonPaths, child: &mut Child, token: &str) {
         let _ = child.wait();
     }
 
-    if lifecycle_lock.is_some() {
+    if let Ok(_guard) = acquire_lifecycle_lock(paths) {
         cleanup_runtime_files_for_token_unlocked(paths, token);
-    } else {
-        cleanup_runtime_files_for_token(paths, token);
     }
 }
 
@@ -696,14 +757,13 @@ fn acquire_start_lock(paths: &DaemonPaths, token: String) -> Result<(), String> 
                     }
                     StartLockStatus::Stale(record) => {
                         if let Some(record) = record {
-                            remove_record_file_if_matches(&paths.lock_file, &record).map_err(
-                                |err| {
+                            remove_record_file_if_matches_unlocked(&paths.lock_file, &record)
+                                .map_err(|err| {
                                     format!(
                                         "failed to remove stale daemon lock {}: {err}",
                                         paths.lock_file.display()
                                     )
-                                },
-                            )?;
+                                })?;
                         }
                     }
                 }
@@ -813,10 +873,6 @@ fn cleanup_invalid_state_files_unlocked(paths: &DaemonPaths) {
         let _ = remove_file_if_exists(&paths.state_file);
         let _ = remove_file_if_exists(&paths.stop_file);
     }
-}
-
-fn remove_record_file_if_matches(path: &Path, expected: &DaemonRecord) -> io::Result<bool> {
-    remove_record_file_if_matches_unlocked(path, expected)
 }
 
 fn cleanup_state_files_for_record_unlocked(paths: &DaemonPaths, record: &DaemonRecord) {
@@ -1364,6 +1420,26 @@ mod tests {
         let paths = DaemonPaths::new(&dir);
 
         assert_eq!(inspect_status(&paths), DaemonStatus::Stopped);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_state_falls_back_to_starting_lock() {
+        let dir = temp_test_dir("status-starting-lock");
+        let paths = DaemonPaths::new(&dir);
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let starting = DaemonRecord::new(
+            process::id(),
+            "token".to_owned(),
+            current_exe_string(),
+            MODE_STARTING,
+        );
+        write_new_record(&paths.lock_file, &starting).expect("starting lock should be written");
+
+        assert!(matches!(inspect_status(&paths), DaemonStatus::Starting(_)));
+        let err = stop(&paths).expect_err("stop should not report starting daemon as stopped");
+        assert!(err.contains("startup is in progress"));
 
         let _ = fs::remove_dir_all(dir);
     }
