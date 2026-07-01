@@ -510,21 +510,32 @@ fn run_daemon(
 fn inspect_status(paths: &DaemonPaths) -> DaemonStatus {
     match read_record(&paths.state_file) {
         Ok(Some(record)) => inspect_record_status(record),
-        Ok(None) => inspect_lock_without_state(paths, "daemon state is missing"),
-        Err(reason) => {
-            inspect_lock_without_state(paths, format!("daemon state is invalid: {reason}"))
+        Ok(None) => inspect_lock_without_state(paths, StateFileIssue::Missing),
+        Err(reason) => inspect_lock_without_state(paths, StateFileIssue::Invalid(reason)),
+    }
+}
+
+enum StateFileIssue {
+    Missing,
+    Invalid(String),
+}
+
+impl StateFileIssue {
+    fn reason(&self) -> String {
+        match self {
+            Self::Missing => "daemon state is missing".to_owned(),
+            Self::Invalid(reason) => format!("daemon state is invalid: {reason}"),
         }
     }
 }
 
-fn inspect_lock_without_state(
-    paths: &DaemonPaths,
-    state_reason: impl Into<String>,
-) -> DaemonStatus {
-    let state_reason = state_reason.into();
+fn inspect_lock_without_state(paths: &DaemonPaths, state_issue: StateFileIssue) -> DaemonStatus {
+    let state_reason = state_issue.reason();
     let record = match read_record(&paths.lock_file) {
         Ok(Some(record)) => record,
-        Ok(None) if state_reason == "daemon state is missing" => return DaemonStatus::Stopped,
+        Ok(None) if matches!(state_issue, StateFileIssue::Missing) => {
+            return DaemonStatus::Stopped;
+        }
         Ok(None) => {
             return DaemonStatus::Stale {
                 pid: None,
