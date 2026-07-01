@@ -87,6 +87,8 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 引入 config、state、session 和 domain model 层。这是基础设施步骤——暂时没有编排逻辑或 adapter 实现。重点是稳定的数据结构和安全的持久化。
 
+设计说明：[0.2 Runtime Foundations 设计](design/0.2-runtime-foundations.zh.md)。
+
 包含：
 
 - 带 `version` 字段的 profile 和 config loading，为未来迁移预留空间。

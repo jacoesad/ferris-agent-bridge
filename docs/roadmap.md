@@ -87,6 +87,8 @@ Goal:
 
 Introduce the config, state, session, and domain model layers. This is the infrastructure step — no orchestration or adapter logic yet. The focus is on stable data structures and safe persistence.
 
+Design note: [0.2 Runtime Foundations Design](design/0.2-runtime-foundations.md).
+
 Included:
 
 - Profile and config loading with a `version` field for future migration.
