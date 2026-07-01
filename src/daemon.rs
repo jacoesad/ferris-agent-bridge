@@ -16,12 +16,18 @@ const STATE_FILE: &str = "daemon.state";
 const STOP_FILE: &str = "daemon.stop";
 const LOG_FILE: &str = "daemon.log";
 const LIFECYCLE_LOCK_FILE: &str = "daemon.lifecycle.lock";
+const MODE_STARTING: &str = "starting";
+const MODE_BACKGROUND: &str = "background";
+const MODE_FOREGROUND: &str = "foreground";
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTING_LOCK_TTL: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const START_FAILURE_STOP_TIMEOUT: Duration = Duration::from_millis(500);
-const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
-const LIFECYCLE_LOCK_STALE_TTL: Duration = Duration::from_secs(30);
+// A normal stop can wait once for graceful exit and once after force-stop.
+// The stale TTL stays above that budget, and the wait timeout stays above the
+// stale TTL so the first waiter after a crash can recover the lock.
+const LIFECYCLE_LOCK_STALE_TTL: Duration = Duration::from_secs(15);
+const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIFECYCLE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -430,9 +436,9 @@ pub fn run_daemon_from_env(
 ) -> Result<String, String> {
     let paths = DaemonPaths::from_env()?;
     let mode = if foreground {
-        "foreground"
+        MODE_FOREGROUND
     } else {
-        "background"
+        MODE_BACKGROUND
     };
     run_daemon(&paths, token, starter_pid, mode)?;
     Ok(format!("{NAME} daemon stopped."))
@@ -529,7 +535,7 @@ fn wait_for_running(paths: &DaemonPaths, pid: u32, token: &str) -> Result<(), St
 fn ready_record_matches(path: &Path, pid: u32, token: &str) -> Result<bool, String> {
     match read_record(path) {
         Ok(Some(record)) => {
-            Ok(record.pid == pid && record.token == token && record.mode != "starting")
+            Ok(record.pid == pid && record.token == token && record.mode != MODE_STARTING)
         }
         Ok(None) => Ok(false),
         Err(reason) => Err(format!(
@@ -543,7 +549,7 @@ fn validate_startup_lock(paths: &DaemonPaths, token: &str, starter_pid: u32) -> 
     let record = read_record(&paths.lock_file)?
         .ok_or_else(|| "refusing to run daemon: startup lock is missing".to_owned())?;
 
-    if record.mode != "starting" {
+    if record.mode != MODE_STARTING {
         return Err(format!(
             "refusing to run daemon: startup lock mode is `{}` instead of `starting`",
             record.mode
@@ -672,7 +678,7 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
 }
 
 fn acquire_start_lock(paths: &DaemonPaths, token: String) -> Result<(), String> {
-    let record = DaemonRecord::new(process::id(), token, current_exe_string(), "starting");
+    let record = DaemonRecord::new(process::id(), token, current_exe_string(), MODE_STARTING);
 
     loop {
         match write_new_record(&paths.lock_file, &record) {
@@ -720,7 +726,7 @@ fn inspect_start_lock(paths: &DaemonPaths) -> StartLockStatus {
         Err(reason) => return StartLockStatus::Unsafe(reason),
     };
 
-    if record.mode == "starting" {
+    if record.mode == MODE_STARTING {
         let is_fresh =
             Duration::from_secs(now_unix_seconds().saturating_sub(record.started_at_unix))
                 <= STARTING_LOCK_TTL;
@@ -1137,7 +1143,7 @@ fn inspect_process_identity(record: &DaemonRecord) -> ProcessIdentity {
         return ProcessIdentity::Unverified("process command line is empty".to_owned());
     }
 
-    if record.mode == "foreground" {
+    if record.mode == MODE_FOREGROUND {
         if command_line.contains("__daemon")
             && command_line.contains(&record.token)
             && command_line.contains("--foreground")
@@ -1308,11 +1314,32 @@ mod tests {
 
     #[test]
     fn record_roundtrips() {
-        let record = DaemonRecord::new(42, "token".to_owned(), "/tmp/fab".to_owned(), "background");
+        let record = DaemonRecord::new(
+            42,
+            "token".to_owned(),
+            "/tmp/fab".to_owned(),
+            MODE_BACKGROUND,
+        );
 
         let decoded = DaemonRecord::decode(&record.encode()).expect("record should decode");
 
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn lifecycle_timeout_budget_allows_stale_recovery() {
+        assert!(
+            LIFECYCLE_LOCK_STALE_TTL > STOP_TIMEOUT + STOP_TIMEOUT,
+            "lifecycle lock stale TTL should exceed graceful stop plus force-stop wait"
+        );
+        assert!(
+            LIFECYCLE_LOCK_TIMEOUT > LIFECYCLE_LOCK_STALE_TTL,
+            "lifecycle lock wait timeout should let a waiter reach stale recovery"
+        );
+        assert!(
+            STARTING_LOCK_TTL > START_TIMEOUT,
+            "starting lock TTL should outlive normal start readiness wait"
+        );
     }
 
     #[test]
@@ -1335,7 +1362,7 @@ mod tests {
             u32::MAX,
             "token".to_owned(),
             "missing".to_owned(),
-            "background",
+            MODE_BACKGROUND,
         );
         write_record(&paths.state_file, &record).expect("state should be written");
 
@@ -1391,7 +1418,7 @@ mod tests {
             u32::MAX,
             "stale-token".to_owned(),
             "missing".to_owned(),
-            "background",
+            MODE_BACKGROUND,
         );
         write_new_record(&paths.lock_file, &stale).expect("stale lock should be written");
 
@@ -1402,7 +1429,7 @@ mod tests {
             .expect("lock should exist");
 
         assert_eq!(next.token, "next-token");
-        assert_eq!(next.mode, "starting");
+        assert_eq!(next.mode, MODE_STARTING);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1416,7 +1443,7 @@ mod tests {
             u32::MAX,
             "active-token".to_owned(),
             "active-exe".to_owned(),
-            "background",
+            MODE_BACKGROUND,
         );
         write_record(&paths.lock_file, &active).expect("active lock should be written");
         write_record(&paths.state_file, &active).expect("active state should be written");
@@ -1425,7 +1452,7 @@ mod tests {
             &paths,
             "rogue-token".to_owned(),
             process::id(),
-            "background",
+            MODE_BACKGROUND,
         )
         .expect_err("internal daemon should require a startup lock");
 
@@ -1456,7 +1483,7 @@ mod tests {
             process::id(),
             token.clone(),
             "starter".to_owned(),
-            "starting",
+            MODE_STARTING,
         );
         write_new_record(&paths.lock_file, &starting).expect("starting lock should be written");
 
@@ -1480,7 +1507,7 @@ mod tests {
             process::id(),
             token.clone(),
             current_exe_string(),
-            "starting",
+            MODE_STARTING,
         );
 
         write_new_record(&paths.lock_file, &record).expect("lock should be written");
@@ -1545,13 +1572,13 @@ mod tests {
             process::id(),
             "old-token".to_owned(),
             current_exe_string(),
-            "background",
+            MODE_BACKGROUND,
         );
         let new = DaemonRecord::new(
             process::id(),
             "new-token".to_owned(),
             current_exe_string(),
-            "background",
+            MODE_BACKGROUND,
         );
         write_record(&paths.state_file, &new).expect("new state should be written");
 
@@ -1572,13 +1599,13 @@ mod tests {
             u32::MAX - 1,
             "old-token".to_owned(),
             "old-exe".to_owned(),
-            "background",
+            MODE_BACKGROUND,
         );
         let new = DaemonRecord::new(
             u32::MAX,
             "new-token".to_owned(),
             "new-exe".to_owned(),
-            "background",
+            MODE_BACKGROUND,
         );
 
         write_record(&paths.lock_file, &new).expect("new lock should be written");
@@ -1613,7 +1640,7 @@ mod tests {
             process::id(),
             "missing-token".to_owned(),
             current_exe_string(),
-            "background",
+            MODE_BACKGROUND,
         );
 
         assert!(!record_matches_process(&record));
@@ -1636,7 +1663,7 @@ mod tests {
                 child.id(),
                 "token".to_owned(),
                 "sleep".to_owned(),
-                "background",
+                MODE_BACKGROUND,
             ),
         )
         .expect("lock should be written");
@@ -1646,7 +1673,7 @@ mod tests {
                 child.id(),
                 "token".to_owned(),
                 "sleep".to_owned(),
-                "background",
+                MODE_BACKGROUND,
             ),
         )
         .expect("state should be written");
