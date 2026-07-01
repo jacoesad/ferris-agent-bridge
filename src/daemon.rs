@@ -448,6 +448,7 @@ pub fn stop(paths: &DaemonPaths) -> Result<String, String> {
             }
 
             cleanup_runtime_files_for_record_unlocked(paths, &record);
+            cleanup_invalid_state_files_unlocked(paths);
 
             Ok(format!("{NAME} daemon stopped.\npid: {}", record.pid))
         }
@@ -553,7 +554,7 @@ fn inspect_lock_without_state(paths: &DaemonPaths, state_issue: StateFileIssue) 
     };
 
     if record.mode == MODE_STARTING {
-        if is_process_running(record.pid) {
+        if starting_lock_is_live(&record) {
             return DaemonStatus::Starting(record);
         }
 
@@ -816,11 +817,7 @@ fn inspect_start_lock(paths: &DaemonPaths) -> StartLockStatus {
     };
 
     if record.mode == MODE_STARTING {
-        let is_fresh =
-            Duration::from_secs(now_unix_seconds().saturating_sub(record.started_at_unix))
-                <= STARTING_LOCK_TTL;
-
-        if is_fresh || is_process_running(record.pid) {
+        if starting_lock_is_live(&record) {
             return StartLockStatus::Live;
         }
 
@@ -837,6 +834,13 @@ fn inspect_start_lock(paths: &DaemonPaths) -> StartLockStatus {
             "lock holder process is running but ownership does not match".to_owned(),
         ),
     }
+}
+
+fn starting_lock_is_live(record: &DaemonRecord) -> bool {
+    let is_fresh = Duration::from_secs(now_unix_seconds().saturating_sub(record.started_at_unix))
+        <= STARTING_LOCK_TTL;
+
+    is_fresh && is_process_running(record.pid)
 }
 
 fn should_stop(paths: &DaemonPaths, token: &str) -> bool {
@@ -1625,6 +1629,45 @@ mod tests {
         assert!(matches!(inspect_status(&paths), DaemonStatus::Starting(_)));
         let err = stop(&paths).expect_err("stop should not report starting daemon as stopped");
         assert!(err.contains("startup is in progress"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_starting_lock_with_live_pid_is_recovered() {
+        let dir = temp_test_dir("stale-starting-live-pid");
+        let paths = DaemonPaths::new(&dir);
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let mut starting = DaemonRecord::new(
+            process::id(),
+            "stale-token".to_owned(),
+            current_exe_string(),
+            MODE_STARTING,
+        );
+        starting.started_at_unix = 1;
+        write_new_record(&paths.lock_file, &starting).expect("starting lock should be written");
+
+        let preparation =
+            prepare_start(&paths).expect("stale starting lock should not block forever");
+        let token = match preparation {
+            StartPreparation::Ready {
+                token,
+                lifecycle_lock,
+            } => {
+                drop(lifecycle_lock);
+                token
+            }
+            StartPreparation::AlreadyRunning(record) => {
+                panic!("stale starting lock should not report running: {record:?}")
+            }
+        };
+        let next = read_record(&paths.lock_file)
+            .expect("lock should read")
+            .expect("lock should exist");
+
+        assert_eq!(next.token, token);
+        assert_eq!(next.mode, MODE_STARTING);
+        cleanup_runtime_files_for_token(&paths, &token);
 
         let _ = fs::remove_dir_all(dir);
     }

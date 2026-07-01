@@ -137,6 +137,50 @@ fn foreground_daemon_can_be_stopped_from_another_command() {
     );
 }
 
+#[test]
+fn stop_after_lock_fallback_removes_invalid_state() {
+    let runtime = RuntimeDir::new();
+    let mut child = Command::new(&runtime.bin)
+        .arg("run")
+        .env(HOME_ENV, &runtime.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("foreground bridge command should start");
+
+    let running = wait_until(Duration::from_secs(2), || {
+        let status = runtime.run(["status"]);
+
+        status.status.success() && stdout(&status).contains("daemon is running")
+    });
+    assert!(running, "foreground daemon should become running");
+
+    let state_file = runtime.path.join("daemon.state");
+    fs::write(&state_file, "pid=").expect("state should be corrupted");
+
+    let status = runtime.run(["status"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("identity: unverified"));
+
+    let stop = runtime.run(["stop"]);
+    assert_success(&stop);
+    assert!(stdout(&stop).contains("daemon stopped"));
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(2)),
+        "foreground command should exit after stop"
+    );
+    assert!(!state_file.exists(), "invalid state should be removed");
+    assert!(
+        !runtime.path.join("daemon.lock").exists(),
+        "matching lock should be removed"
+    );
+
+    let stopped_status = runtime.run(["status"]);
+    assert_success(&stopped_status);
+    assert!(stdout(&stopped_status).contains("daemon is stopped"));
+}
+
 struct RuntimeDir {
     bin: PathBuf,
     path: PathBuf,
