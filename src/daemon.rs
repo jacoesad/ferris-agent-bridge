@@ -915,22 +915,33 @@ fn create_lifecycle_lock(path: &Path) -> io::Result<LifecycleLockGuard> {
     configure_private_file_options(&mut options);
     let mut file = options.open(path)?;
 
-    file.write_all(
-        format!(
-            "pid={}\ntoken={}\nstarted_at_unix={}\n",
-            process::id(),
-            token,
-            now_unix_seconds()
-        )
-        .as_bytes(),
-    )?;
-    file.sync_all()?;
-    set_private_file_permissions(path)?;
+    let result = file
+        .write_all(lifecycle_lock_contents(&token).as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| set_private_file_permissions(path));
+
+    if let Err(err) = result {
+        cleanup_incomplete_lifecycle_lock(path);
+        return Err(err);
+    }
 
     Ok(LifecycleLockGuard {
         lock_file: path.to_owned(),
         token,
     })
+}
+
+fn cleanup_incomplete_lifecycle_lock(path: &Path) {
+    let _ = remove_file_if_exists(path);
+}
+
+fn lifecycle_lock_contents(token: &str) -> String {
+    format!(
+        "pid={}\ntoken={}\nstarted_at_unix={}\n",
+        process::id(),
+        token,
+        now_unix_seconds()
+    )
 }
 
 fn stale_lifecycle_lock_token(path: &Path) -> Option<String> {
@@ -1506,6 +1517,20 @@ mod tests {
         );
 
         drop(new_guard);
+        assert!(!lock_file.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn incomplete_lifecycle_lock_cleanup_removes_tokenless_file() {
+        let dir = temp_test_dir("incomplete-lifecycle-lock");
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+
+        cleanup_incomplete_lifecycle_lock(&lock_file);
+
         assert!(!lock_file.exists());
 
         let _ = fs::remove_dir_all(dir);
