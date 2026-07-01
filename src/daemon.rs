@@ -177,6 +177,7 @@ pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
             lifecycle_lock,
         } => (token, lifecycle_lock),
     };
+    let mut startup_cleanup = StartCleanupGuard::new(paths, &token);
 
     let exe =
         env::current_exe().map_err(|err| format!("failed to locate current executable: {err}"))?;
@@ -198,13 +199,11 @@ pub fn start_background(paths: &DaemonPaths) -> Result<String, String> {
         .stderr(Stdio::from(log_for_stderr));
     detach_background_command(&mut command);
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            cleanup_runtime_files_for_token_unlocked(paths, &token);
-            return Err(format!("failed to start daemon: {err}"));
-        }
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to start daemon: {err}"))?;
+    startup_cleanup.disarm();
+    drop(startup_cleanup);
     drop(lifecycle_lock);
 
     wait_for_start_ready(paths, &mut child, &token)?;
@@ -227,6 +226,7 @@ pub fn run_foreground(paths: &DaemonPaths) -> Result<String, String> {
             lifecycle_lock,
         } => (token, lifecycle_lock),
     };
+    let mut startup_cleanup = StartCleanupGuard::new(paths, &token);
 
     let exe =
         env::current_exe().map_err(|err| format!("failed to locate current executable: {err}"))?;
@@ -248,13 +248,11 @@ pub fn run_foreground(paths: &DaemonPaths) -> Result<String, String> {
         paths.runtime_dir.display()
     );
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            cleanup_runtime_files_for_token_unlocked(paths, &token);
-            return Err(format!("failed to run foreground daemon: {err}"));
-        }
-    };
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to run foreground daemon: {err}"))?;
+    startup_cleanup.disarm();
+    drop(startup_cleanup);
     drop(lifecycle_lock);
 
     wait_for_start_ready(paths, &mut child, &token)?;
@@ -277,6 +275,34 @@ enum StartPreparation {
         token: String,
         lifecycle_lock: LifecycleLockGuard,
     },
+}
+
+struct StartCleanupGuard<'a> {
+    paths: &'a DaemonPaths,
+    token: &'a str,
+    armed: bool,
+}
+
+impl<'a> StartCleanupGuard<'a> {
+    fn new(paths: &'a DaemonPaths, token: &'a str) -> Self {
+        Self {
+            paths,
+            token,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            cleanup_runtime_files_for_token_unlocked(self.paths, self.token);
+        }
+    }
 }
 
 fn prepare_start(paths: &DaemonPaths) -> Result<StartPreparation, String> {
@@ -1393,6 +1419,34 @@ mod tests {
             .expect_err("wrong starter pid should be rejected");
 
         assert!(err.contains("starter pid"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn start_cleanup_guard_removes_startup_files_before_spawn() {
+        let dir = temp_test_dir("start-cleanup-guard");
+        let paths = DaemonPaths::new(&dir);
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let token = "token".to_owned();
+        let record = DaemonRecord::new(
+            process::id(),
+            token.clone(),
+            current_exe_string(),
+            "starting",
+        );
+
+        write_new_record(&paths.lock_file, &record).expect("lock should be written");
+        write_record(&paths.state_file, &record).expect("state should be written");
+        write_private_file(&paths.stop_file, &token).expect("stop should be written");
+
+        {
+            let _guard = StartCleanupGuard::new(&paths, &token);
+        }
+
+        assert!(!paths.lock_file.exists());
+        assert!(!paths.state_file.exists());
+        assert!(!paths.stop_file.exists());
 
         let _ = fs::remove_dir_all(dir);
     }
