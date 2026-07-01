@@ -869,11 +869,12 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
 
 struct LifecycleLockGuard {
     lock_file: PathBuf,
+    token: String,
 }
 
 impl Drop for LifecycleLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_file);
+        let _ = remove_lifecycle_lock_if_matches(&self.lock_file, &self.token);
     }
 }
 
@@ -885,8 +886,8 @@ fn acquire_lifecycle_lock(paths: &DaemonPaths) -> io::Result<LifecycleLockGuard>
         match create_lifecycle_lock(&lock_file) {
             Ok(guard) => return Ok(guard),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                if lifecycle_lock_is_stale(&lock_file) {
-                    let _ = remove_file_if_exists(&lock_file);
+                if let Some(token) = stale_lifecycle_lock_token(&lock_file) {
+                    let _ = remove_lifecycle_lock_if_matches(&lock_file, &token);
                     continue;
                 }
 
@@ -908,6 +909,7 @@ fn acquire_lifecycle_lock(paths: &DaemonPaths) -> io::Result<LifecycleLockGuard>
 }
 
 fn create_lifecycle_lock(path: &Path) -> io::Result<LifecycleLockGuard> {
+    let token = generate_token();
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     configure_private_file_options(&mut options);
@@ -915,8 +917,9 @@ fn create_lifecycle_lock(path: &Path) -> io::Result<LifecycleLockGuard> {
 
     file.write_all(
         format!(
-            "pid={}\nstarted_at_unix={}\n",
+            "pid={}\ntoken={}\nstarted_at_unix={}\n",
             process::id(),
+            token,
             now_unix_seconds()
         )
         .as_bytes(),
@@ -926,16 +929,49 @@ fn create_lifecycle_lock(path: &Path) -> io::Result<LifecycleLockGuard> {
 
     Ok(LifecycleLockGuard {
         lock_file: path.to_owned(),
+        token,
     })
 }
 
-fn lifecycle_lock_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
+fn stale_lifecycle_lock_token(path: &Path) -> Option<String> {
+    let is_stale = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .map(|elapsed| elapsed > LIFECYCLE_LOCK_STALE_TTL)
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+    if !is_stale {
+        return None;
+    }
+
+    read_lifecycle_lock_token(path).ok().flatten()
+}
+
+fn read_lifecycle_lock_token(path: &Path) -> io::Result<Option<String>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    Ok(content.lines().find_map(|line| {
+        line.strip_prefix("token=")
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+    }))
+}
+
+fn remove_lifecycle_lock_if_matches(path: &Path, token: &str) -> io::Result<bool> {
+    let should_remove = read_lifecycle_lock_token(path)?
+        .map(|current| current == token)
+        .unwrap_or(false);
+
+    if should_remove {
+        remove_file_if_exists(path)?;
+    }
+
+    Ok(should_remove)
 }
 
 fn open_log_file(paths: &DaemonPaths) -> Result<fs::File, String> {
@@ -1447,6 +1483,30 @@ mod tests {
         assert!(!paths.lock_file.exists());
         assert!(!paths.state_file.exists());
         assert!(!paths.stop_file.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lifecycle_lock_drop_does_not_remove_replaced_lock() {
+        let dir = temp_test_dir("lifecycle-lock-drop");
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+
+        let old_guard = create_lifecycle_lock(&lock_file).expect("old lock should be created");
+        remove_file_if_exists(&lock_file).expect("stale lock should be removed");
+        let new_guard = create_lifecycle_lock(&lock_file).expect("new lock should be created");
+        let new_token = new_guard.token.clone();
+
+        drop(old_guard);
+
+        assert_eq!(
+            read_lifecycle_lock_token(&lock_file).expect("lock token should read"),
+            Some(new_token)
+        );
+
+        drop(new_guard);
+        assert!(!lock_file.exists());
 
         let _ = fs::remove_dir_all(dir);
     }
