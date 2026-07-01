@@ -892,9 +892,16 @@ fn acquire_lifecycle_lock(paths: &DaemonPaths) -> io::Result<LifecycleLockGuard>
         match create_lifecycle_lock(&lock_file) {
             Ok(guard) => return Ok(guard),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                if let Some(token) = stale_lifecycle_lock_token(&lock_file) {
-                    let _ = remove_lifecycle_lock_if_matches(&lock_file, &token);
-                    continue;
+                match inspect_stale_lifecycle_lock(&lock_file) {
+                    StaleLifecycleLock::Owned(token) => {
+                        let _ = remove_lifecycle_lock_if_matches(&lock_file, &token);
+                        continue;
+                    }
+                    StaleLifecycleLock::Incomplete => {
+                        cleanup_incomplete_lifecycle_lock(&lock_file);
+                        continue;
+                    }
+                    StaleLifecycleLock::NotStale => {}
                 }
 
                 if started.elapsed() >= LIFECYCLE_LOCK_TIMEOUT {
@@ -950,7 +957,13 @@ fn lifecycle_lock_contents(token: &str) -> String {
     )
 }
 
-fn stale_lifecycle_lock_token(path: &Path) -> Option<String> {
+enum StaleLifecycleLock {
+    NotStale,
+    Owned(String),
+    Incomplete,
+}
+
+fn inspect_stale_lifecycle_lock(path: &Path) -> StaleLifecycleLock {
     let is_stale = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -959,10 +972,13 @@ fn stale_lifecycle_lock_token(path: &Path) -> Option<String> {
         .unwrap_or(false);
 
     if !is_stale {
-        return None;
+        return StaleLifecycleLock::NotStale;
     }
 
-    read_lifecycle_lock_token(path).ok().flatten()
+    match read_lifecycle_lock_token(path) {
+        Ok(Some(token)) => StaleLifecycleLock::Owned(token),
+        Ok(None) | Err(_) => StaleLifecycleLock::Incomplete,
+    }
 }
 
 fn read_lifecycle_lock_token(path: &Path) -> io::Result<Option<String>> {
@@ -1558,6 +1574,35 @@ mod tests {
 
         cleanup_incomplete_lifecycle_lock(&lock_file);
 
+        assert!(!lock_file.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acquire_lifecycle_lock_recovers_tokenless_stale_lock() {
+        let dir = temp_test_dir("tokenless-stale-lifecycle-lock");
+        let paths = DaemonPaths::new(&dir);
+        fs::create_dir_all(&dir).expect("test dir should be created");
+        let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
+        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+
+        let status = Command::new("touch")
+            .args(["-t", "197001010000"])
+            .arg(&lock_file)
+            .status()
+            .expect("touch should run");
+        assert!(status.success(), "touch should mark lock as stale");
+
+        let guard = acquire_lifecycle_lock(&paths).expect("stale tokenless lock should recover");
+
+        assert_eq!(
+            read_lifecycle_lock_token(&lock_file).expect("lock token should read"),
+            Some(guard.token.clone())
+        );
+
+        drop(guard);
         assert!(!lock_file.exists());
 
         let _ = fs::remove_dir_all(dir);
