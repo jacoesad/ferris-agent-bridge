@@ -8,7 +8,7 @@
 
 ## 状态
 
-🚧 早期开发中。已发布的 `0.0.1` 版本提供最小 Rust binary。当前开发分支提供本地 daemon lifecycle commands，runtime 和 adapter 集成会在后续阶段推进。
+🚧 早期开发中。已发布的 `0.1.0` 版本提供本地 daemon lifecycle commands，runtime 和 adapter 集成会在后续阶段推进。
 
 ## 目标
 

@@ -1,6 +1,6 @@
 [package]
 name = "ferris-agent-bridge"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 authors = ["jacoesad <jacoesad@126.com>"]
 description = "A Rust-first bridge for local AI agents to chat platforms."

@@ -8,7 +8,7 @@ A Rust-first bridge for local AI agents to chat platforms.
 
 ## Status
 
-🚧 Early development. The published `0.0.1` release provides a minimal Rust binary. The current development branch provides local daemon lifecycle commands before runtime and adapter integration.
+🚧 Early development. The published `0.1.0` release provides local daemon lifecycle commands before runtime and adapter integration.
 
 ## Goals
 
