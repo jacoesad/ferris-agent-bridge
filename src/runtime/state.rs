@@ -1,0 +1,501 @@
+use std::{
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Deserializer, Serialize, de, de::DeserializeOwned};
+
+use super::session::{Session, SessionId};
+
+pub const RUNTIME_STATE_VERSION: u32 = 1;
+
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeState {
+    version: u32,
+    sessions: Vec<Session>,
+    updated_at_unix: u64,
+}
+
+impl RuntimeState {
+    pub fn new() -> Self {
+        Self {
+            version: RUNTIME_STATE_VERSION,
+            sessions: Vec::new(),
+            updated_at_unix: unix_seconds_now(),
+        }
+    }
+
+    pub fn upsert_session(&mut self, session: Session) {
+        if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|existing| existing.id() == session.id())
+        {
+            existing.refresh_from(session);
+        } else {
+            self.sessions.push(session);
+        }
+
+        self.updated_at_unix = unix_seconds_now();
+    }
+
+    pub fn session(&self, id: &SessionId) -> Option<&Session> {
+        self.sessions.iter().find(|session| session.id() == id)
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
+    pub fn updated_at_unix(&self) -> u64 {
+        self.updated_at_unix
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != RUNTIME_STATE_VERSION {
+            return Err(format!(
+                "unsupported runtime state version {}; expected {}",
+                self.version, RUNTIME_STATE_VERSION
+            ));
+        }
+
+        let mut session_ids = BTreeSet::new();
+
+        for session in &self.sessions {
+            session.validate()?;
+
+            if !session_ids.insert(session.id()) {
+                return Err(format!("duplicate session id {}", session.id()));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RuntimeStateWire {
+            version: u32,
+            sessions: Vec<Session>,
+            updated_at_unix: u64,
+        }
+
+        let wire = RuntimeStateWire::deserialize(deserializer)?;
+        let state = Self {
+            version: wire.version,
+            sessions: wire.sessions,
+            updated_at_unix: wire.updated_at_unix,
+        };
+        state.validate().map_err(de::Error::custom)?;
+        Ok(state)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StateStore {
+    path: PathBuf,
+}
+
+impl StateStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<RuntimeState, String> {
+        let input = match fs::read_to_string(&self.path) {
+            Ok(input) => input,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(RuntimeState::new());
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to read runtime state {}: {err}",
+                    self.path.display()
+                ));
+            }
+        };
+
+        let state: RuntimeState = serde_json::from_str(&input)
+            .map_err(|err| format!("failed to parse {}: {err}", self.path.display()))?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn save(&self, state: &RuntimeState) -> Result<(), String> {
+        state.validate()?;
+        write_json_atomic(&self.path, state).map_err(|err| {
+            format!(
+                "failed to save runtime state {}: {err}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+
+    serde_json::from_str(&input).map_err(|err| format!("failed to parse {}: {err}", path.display()))
+}
+
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    if let Some(parent) = non_empty_parent(path) {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = temp_path_for(path);
+    let mut encoded = serde_json::to_vec_pretty(value)?;
+    encoded.push(b'\n');
+
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        set_private_file_permissions(&file)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temp_path, path)?;
+        sync_parent(path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    write_result
+}
+
+#[cfg(not(windows))]
+fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    unsafe extern "system" {
+        fn MoveFileExW(src: *const u16, dst: *const u16, flags: u32) -> i32;
+    }
+
+    fn wide_null(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let src = wide_null(src.as_os_str());
+    let dst = wide_null(dst.as_os_str());
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+
+    // SAFETY: both paths are null-terminated UTF-16 buffers that live for the
+    // duration of the call, and MoveFileExW does not retain the pointers.
+    match unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), flags) } {
+        0 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("runtime-state");
+
+    path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}.{}",
+        process::id(),
+        nanos,
+        sequence
+    ))
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = non_empty_parent(path) {
+        File::open(parent)?.sync_all()?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn non_empty_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{RuntimeState, StateStore, non_empty_parent};
+    use crate::runtime::session::{Session, SessionScope};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn state_store_round_trips_sessions() {
+        let path = test_path("state-round-trip").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+
+        store.save(&state).expect("state should save");
+        let loaded = store.load().expect("state should load");
+
+        assert!(loaded.session(&session_id).is_some());
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn state_store_replaces_existing_state_file() {
+        let path = test_path("state-replace-existing").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let first_scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let second_scope = SessionScope::new("lark", "chat:oc_456").expect("valid scope");
+        let mut state = RuntimeState::new();
+        state.upsert_session(Session::new(first_scope));
+        store.save(&state).expect("initial state should save");
+
+        state.upsert_session(Session::new(second_scope));
+        store
+            .save(&state)
+            .expect("existing state file should be replaced");
+
+        let loaded = store.load().expect("replaced state should load");
+        assert_eq!(loaded.sessions().len(), 2);
+    }
+
+    #[test]
+    fn upsert_session_preserves_created_at_for_existing_session() {
+        let path = test_path("state-upsert-preserves-created").join("runtime.state.json");
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session_id = crate::runtime::session::SessionId::for_scope(&scope);
+        let first = session_fixture(&scope, 10, 20);
+        let second = session_fixture(&scope, 30, 40);
+        let mut state = RuntimeState::new();
+
+        state.upsert_session(first);
+        state.upsert_session(second);
+
+        let session = state.session(&session_id).expect("session should exist");
+        assert_eq!(session.created_at_unix(), 10);
+        assert_eq!(session.updated_at_unix(), 40);
+
+        state.upsert_session(session_fixture(&scope, 5, 15));
+        let session = state.session(&session_id).expect("session should exist");
+        assert_eq!(session.created_at_unix(), 10);
+        assert_eq!(session.updated_at_unix(), 40);
+
+        StateStore::new(path)
+            .save(&state)
+            .expect("state should remain valid");
+    }
+
+    #[test]
+    fn missing_state_loads_as_empty_state() {
+        let path = test_path("missing-state").join("runtime.state.json");
+        let store = StateStore::new(path);
+        let state = store.load().expect("missing state should be defaulted");
+
+        assert!(state.sessions().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_load_does_not_default_non_not_found_path_errors() {
+        let dir = test_path("state-load-path-error");
+        let parent_file = dir.join("not-a-directory");
+        fs::write(&parent_file, "not a directory").expect("parent fixture should write");
+        let path = parent_file.join("runtime.state.json");
+        let store = StateStore::new(&path);
+
+        assert!(
+            !path.exists(),
+            "Path::exists should collapse this path error to false"
+        );
+
+        let err = store
+            .load()
+            .expect_err("path errors must not be treated as missing state");
+
+        assert!(err.contains("failed to read runtime state"));
+    }
+
+    #[test]
+    fn state_validation_rejects_duplicate_session_ids() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let path = test_path("state-duplicate-session-ids").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": 1,
+                "sessions": [{session}, {session}],
+                "updated_at_unix": 1
+            }}"#,
+            session = serde_json::to_string(&session).expect("session should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("duplicate session ids should be rejected");
+
+        assert!(err.contains("duplicate session id"));
+    }
+
+    #[test]
+    fn state_load_rejects_session_id_scope_mismatch() {
+        let path = test_path("state-session-id-mismatch").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "sessions": [{
+                    "id": "session_wrong",
+                    "scope": {"platform": "lark", "scope": "chat:oc_123"},
+                    "created_at_unix": 1,
+                    "updated_at_unix": 1
+                }],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("session id should match derived scope id");
+
+        assert!(err.contains("does not match derived id"));
+    }
+
+    #[test]
+    fn state_load_rejects_session_time_order_mismatch() {
+        let path = test_path("state-session-time-order").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "sessions": [{
+                    "id": "session_v1_4_6c61726b_b_636861743a6f635f313233",
+                    "scope": {"platform": "lark", "scope": "chat:oc_123"},
+                    "created_at_unix": 100,
+                    "updated_at_unix": 1
+                }],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("session updated_at should not be before created_at");
+
+        assert!(err.contains("updated_at_unix before created_at_unix"));
+    }
+
+    #[test]
+    fn relative_file_path_has_no_parent_directory_to_create() {
+        assert!(non_empty_parent(std::path::Path::new("runtime.state.json")).is_none());
+    }
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ferris-agent-bridge-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("test dir should exist");
+        path
+    }
+
+    fn session_fixture(
+        scope: &SessionScope,
+        created_at_unix: u64,
+        updated_at_unix: u64,
+    ) -> Session {
+        serde_json::from_str(&format!(
+            r#"{{
+                "id": "{}",
+                "scope": {{"platform": "{}", "scope": "{}"}},
+                "created_at_unix": {created_at_unix},
+                "updated_at_unix": {updated_at_unix}
+            }}"#,
+            crate::runtime::session::SessionId::for_scope(scope),
+            scope.platform(),
+            scope.scope()
+        ))
+        .expect("session fixture should decode")
+    }
+}
