@@ -85,7 +85,7 @@ Acceptance criteria:
 
 Goal:
 
-Introduce the config, state, session, and domain model layers. This is the infrastructure step — no orchestration or adapter logic yet. The focus is on stable data structures and safe persistence.
+Introduce the config, state, session, and domain model layers. This is the infrastructure step — no orchestration or adapter logic yet. The focus is on stable data structures and atomic persistence primitives.
 
 Design note: [0.2 Runtime Foundations Design](design/0.2-runtime-foundations.md).
 
@@ -93,7 +93,7 @@ Included:
 
 - Profile and config loading with a `version` field for future migration.
 - Config structs with `secret: Option<SecretInput>` placeholder (no keystore implementation yet).
-- Runtime state storage with atomic write semantics.
+- Runtime state storage with atomic write semantics and Unix/macOS private permissions for newly created JSON files.
 - Session identity and continuity model.
 - Core `message` and `event` domain models (platform-neutral).
 - Structured logging with session and event identifiers.
@@ -111,11 +111,12 @@ Not included:
 
 Acceptance criteria:
 
-- Config can be loaded, validated, and saved safely.
+- Config can be loaded, validated, and saved through the shared atomic write path.
 - Sessions have stable identifiers and can be persisted and reloaded.
 - Core domain types (`Message`, `Event`, `Session`) are defined and testable.
 - Structured log events carry session and event context; run context is carried once available in later milestones.
 - Secret-like values are redacted in log output.
+- Newly created runtime JSON files use private permissions on Unix/macOS; explicit Windows ACL hardening is deferred.
 - The daemon foundation from `0.1.0` remains intact.
 
 ## 0.3.0 - Runtime Orchestrator

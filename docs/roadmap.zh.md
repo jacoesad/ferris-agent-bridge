@@ -85,7 +85,7 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 目标：
 
-引入 config、state、session 和 domain model 层。这是基础设施步骤——暂时没有编排逻辑或 adapter 实现。重点是稳定的数据结构和安全的持久化。
+引入 config、state、session 和 domain model 层。这是基础设施步骤——暂时没有编排逻辑或 adapter 实现。重点是稳定的数据结构和原子持久化基础。
 
 设计说明：[0.2 Runtime Foundations 设计](design/0.2-runtime-foundations.zh.md)。
 
@@ -93,7 +93,7 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 - 带 `version` 字段的 profile 和 config loading，为未来迁移预留空间。
 - Config 结构体带有 `secret: Option<SecretInput>` 占位字段（暂不实现 keystore）。
-- 带原子写入语义的 runtime state storage。
+- 带原子写入语义的 runtime state storage，并在 Unix/macOS 上为新建 JSON 文件使用私有权限。
 - Session identity 和 continuity model。
 - Core `message` 和 `event` domain models（平台无关）。
 - 带 session 和 event 标识符的结构化日志。
@@ -111,11 +111,12 @@ Adapter contracts 应基于能力，而不是 SDK。未来的官方 SDK 或 chan
 
 验收标准：
 
-- Config 可以安全加载、验证和保存。
+- Config 可以通过共享 atomic write 路径加载、验证和保存。
 - Sessions 有稳定标识符，可以持久化和重新加载。
 - Core domain types（`Message`、`Event`、`Session`）已定义且可测试。
 - 结构化日志事件携带 session 和 event 上下文；后续里程碑引入 run 后再携带 run 上下文。
 - 类似 secret 的值在日志输出中被脱敏。
+- Unix/macOS 上新建的 runtime JSON 文件使用私有权限；显式 Windows ACL hardening 延后处理。
 - `0.1.0` 的 daemon foundation 保持完整。
 
 ## 0.3.0 - Runtime Orchestrator
