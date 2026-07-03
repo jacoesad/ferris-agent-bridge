@@ -167,7 +167,7 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
 
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = non_empty_parent(path) {
-        fs::create_dir_all(parent)?;
+        ensure_private_parent_dir(parent)?;
     }
 
     let temp_path = temp_path_for(path);
@@ -175,10 +175,7 @@ pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Res
     encoded.push(b'\n');
 
     let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
+        let mut file = open_private_new_file(&temp_path)?;
         set_private_file_permissions(&file)?;
         file.write_all(&encoded)?;
         file.sync_all()?;
@@ -265,6 +262,50 @@ fn non_empty_parent(path: &Path) -> Option<&Path> {
         .filter(|parent| !parent.as_os_str().is_empty())
 }
 
+fn ensure_private_parent_dir(path: &Path) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a directory", path.display()),
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => create_private_dir(path),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+fn open_private_new_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    configure_private_file_options(&mut options);
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn configure_private_file_options(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn configure_private_file_options(_options: &mut OpenOptions) {}
+
 #[cfg(unix)]
 fn set_private_file_permissions(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -293,7 +334,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{RuntimeState, StateStore, non_empty_parent};
+    use super::{RuntimeState, StateStore, non_empty_parent, open_private_new_file};
     use crate::runtime::session::{Session, SessionScope};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -388,6 +429,65 @@ mod tests {
             .expect_err("path errors must not be treated as missing state");
 
         assert!(err.contains("failed to read runtime state"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_save_creates_private_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = test_path("state-private-parent").join("runtime");
+
+        StateStore::new(parent.join("runtime.state.json"))
+            .save(&RuntimeState::new())
+            .expect("state should save");
+
+        let mode = fs::metadata(parent)
+            .expect("parent metadata should load")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_save_does_not_chmod_existing_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_path("state-existing-parent");
+        let parent = dir.join("runtime");
+        fs::create_dir_all(&parent).expect("parent should be created");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755))
+            .expect("parent fixture permissions should be set");
+
+        StateStore::new(parent.join("runtime.state.json"))
+            .save(&RuntimeState::new())
+            .expect("state should save");
+
+        let mode = fs::metadata(parent)
+            .expect("parent metadata should load")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_new_file_uses_private_mode_at_create_time() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = test_path("private-new-file").join("secret.tmp");
+        let file = open_private_new_file(&path).expect("private file should be created");
+
+        let mode = file
+            .metadata()
+            .expect("file metadata should load")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
