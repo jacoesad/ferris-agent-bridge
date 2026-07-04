@@ -124,7 +124,7 @@ fn foreground_daemon_can_be_stopped_from_another_command() {
     let running = wait_until(Duration::from_secs(2), || {
         let status = runtime.run(["status"]);
 
-        status.status.success() && stdout(&status).contains("daemon is running")
+        status.status.success() && is_verified_running_status(&stdout(&status))
     });
     assert!(running, "foreground daemon should become running");
 
@@ -152,7 +152,7 @@ fn stop_after_lock_fallback_removes_invalid_state() {
     let running = wait_until(Duration::from_secs(2), || {
         let status = runtime.run(["status"]);
 
-        status.status.success() && stdout(&status).contains("daemon is running")
+        status.status.success() && is_verified_running_status(&stdout(&status))
     });
     assert!(running, "foreground daemon should become running");
 
@@ -179,6 +179,45 @@ fn stop_after_lock_fallback_removes_invalid_state() {
     let stopped_status = runtime.run(["status"]);
     assert_success(&stopped_status);
     assert!(stdout(&stopped_status).contains("daemon is stopped"));
+}
+
+#[test]
+fn stop_after_lock_fallback_waits_when_state_is_missing() {
+    let runtime = RuntimeDir::new();
+    let mut child = Command::new(&runtime.bin)
+        .arg("run")
+        .env(HOME_ENV, &runtime.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("foreground bridge command should start");
+
+    let running = wait_until(Duration::from_secs(2), || {
+        let status = runtime.run(["status"]);
+
+        status.status.success() && is_verified_running_status(&stdout(&status))
+    });
+    assert!(running, "foreground daemon should become running");
+
+    let state_file = runtime.path.join("daemon.state");
+    fs::remove_file(&state_file).expect("state should be removed");
+
+    let stop = runtime.run(["stop"]);
+    assert_success(&stop);
+    assert!(stdout(&stop).contains("daemon stopped"));
+    assert!(
+        wait_for_child_exit(&mut child, Duration::from_secs(2)),
+        "foreground command should exit after stop"
+    );
+    assert!(
+        !runtime.path.join("daemon.lock").exists(),
+        "matching lock should be removed"
+    );
+    assert!(
+        !runtime.path.join("daemon.stop").exists(),
+        "stop request should be removed after daemon exits"
+    );
 }
 
 struct RuntimeDir {
@@ -231,6 +270,10 @@ fn assert_success(output: &Output) {
 
 fn stdout(output: &Output) -> String {
     output_text(&output.stdout)
+}
+
+fn is_verified_running_status(output: &str) -> bool {
+    output.contains("daemon is running") && !output.contains("identity: unverified")
 }
 
 fn stderr(output: &Output) -> String {

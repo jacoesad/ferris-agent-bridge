@@ -61,9 +61,32 @@ General rule: version information must be finalized before a release tag is crea
 
 ## Release Process
 
-1. Complete development on a `feat/*` or `fix/*` branch.
-2. Update `Cargo.toml` and `CHANGELOG.md` according to the versioning and changelog rules above.
-3. Merge the branch into `main`, if not already merged.
-4. Create an annotated tag: `git tag -a vX.Y.Z -m "Release vX.Y.Z: description"`
-5. Push the tag: `git push origin vX.Y.Z`
-6. Publish to crates.io: `cargo publish`
+Prepare releases on short `release/<version>` branches cut from the latest `main`.
+
+Release PRs should contain only release preparation changes:
+
+- update `Cargo.toml` and `Cargo.lock` versions
+- update `CHANGELOG.md` or release notes
+- make small package metadata or README fixes needed for publishing
+
+Release PRs should run the normal CI checks plus release dry-run verification such as `cargo package` and `cargo publish --dry-run`.
+
+After the release PR is merged back to `main`, tag the resulting `main` commit and publish from that commit. Do not tag or publish from the release branch before it is merged.
+
+Keep annotated tag messages short, for example `Release v0.1.0`. Put release highlights, links, and migration notes in the GitHub Release instead.
+
+Current manual release flow:
+
+1. Cut a short `release/<version>` branch from the latest `main`.
+2. Make release-only changes, such as version, metadata, README, or release notes updates.
+3. Open a release PR and wait for CI and release dry-run checks to pass.
+4. Merge the release PR back to `main`.
+5. Update local `main` to the merged commit.
+6. Verify the merged commit with `cargo publish --dry-run`.
+7. Create and push an annotated tag, for example `v0.1.0`.
+8. Run `cargo publish` from the tagged `main` commit.
+9. Confirm the crate version is visible on crates.io.
+10. Create a GitHub Release from the pushed tag, using the matching `CHANGELOG.md` section as the release notes.
+11. Delete the release branch when it is no longer useful.
+
+Trusted publishing and tag-triggered release automation may be added later.

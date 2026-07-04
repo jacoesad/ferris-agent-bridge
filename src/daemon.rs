@@ -438,7 +438,7 @@ pub fn stop(paths: &DaemonPaths) -> Result<String, String> {
             Ok(format!("{NAME} daemon stopped.\npid: {}", record.pid))
         }
         DaemonStatus::RunningUnverified { record, reason } => {
-            let stopped = request_graceful_stop(paths, &record)?;
+            let stopped = request_graceful_stop_for_unverified_record(paths, &record)?;
 
             if !stopped {
                 return Err(format!(
@@ -565,12 +565,16 @@ fn inspect_lock_without_state(paths: &DaemonPaths, state_issue: StateFileIssue) 
         };
     }
 
-    match inspect_record_status(record) {
+    match inspect_record_status(record.clone()) {
         DaemonStatus::Running(record) => DaemonStatus::RunningUnverified {
             record,
             reason: state_reason,
         },
         DaemonStatus::RunningUnverified { record, reason } => DaemonStatus::RunningUnverified {
+            record,
+            reason: format!("{state_reason}; {reason}"),
+        },
+        DaemonStatus::Unowned { reason, .. } => DaemonStatus::RunningUnverified {
             record,
             reason: format!("{state_reason}; {reason}"),
         },
@@ -677,6 +681,16 @@ fn request_graceful_stop(paths: &DaemonPaths, record: &DaemonRecord) -> Result<b
     Ok(wait_for_stop(paths, record.pid))
 }
 
+fn request_graceful_stop_for_unverified_record(
+    paths: &DaemonPaths,
+    record: &DaemonRecord,
+) -> Result<bool, String> {
+    write_private_file(&paths.stop_file, &record.token)
+        .map_err(|err| format!("failed to write stop request: {err}"))?;
+
+    Ok(wait_for_process_to_exit(record.pid, STOP_TIMEOUT))
+}
+
 fn force_stop_verified(paths: &DaemonPaths, record: &DaemonRecord) -> Result<(), String> {
     match read_record(&paths.state_file) {
         Ok(Some(current)) if record_identity_matches(&current, record) => {}
@@ -727,18 +741,26 @@ fn wait_for_stop(paths: &DaemonPaths, pid: u32) -> bool {
     false
 }
 
-fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
+fn wait_for_process_to_exit(pid: u32, timeout: Duration) -> bool {
     let started = Instant::now();
 
     while started.elapsed() < timeout {
         if !is_process_running(pid) {
-            return Ok(());
+            return true;
         }
 
         thread::sleep(POLL_INTERVAL);
     }
 
-    Err(format!("process {pid} did not exit before timeout"))
+    false
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
+    if wait_for_process_to_exit(pid, timeout) {
+        Ok(())
+    } else {
+        Err(format!("process {pid} did not exit before timeout"))
+    }
 }
 
 fn cleanup_failed_start(paths: &DaemonPaths, child: &mut Child, token: &str) {
@@ -1389,10 +1411,13 @@ fn inspect_process_identity(record: &DaemonRecord) -> ProcessIdentity {
         return ProcessIdentity::Unverified("process command line is empty".to_owned());
     }
 
+    let has_internal_daemon = command_line.contains("__daemon");
+    let has_token = command_line.contains(&record.token);
+
     if record.mode == MODE_FOREGROUND {
-        if command_line.contains("__daemon")
-            && command_line.contains(&record.token)
-            && command_line.contains("--foreground")
+        if has_internal_daemon
+            && has_token
+            && (command_line.contains("--foreground") || command_line.contains(&record.exe))
         {
             return ProcessIdentity::Verified;
         }
@@ -1400,7 +1425,7 @@ fn inspect_process_identity(record: &DaemonRecord) -> ProcessIdentity {
         return ProcessIdentity::Mismatch;
     }
 
-    if command_line.contains("__daemon") && command_line.contains(&record.token) {
+    if has_internal_daemon && has_token {
         ProcessIdentity::Verified
     } else {
         ProcessIdentity::Mismatch
@@ -1473,13 +1498,20 @@ fn detach_background_command(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let output = Command::new("kill").arg("-0").arg(pid.to_string()).output();
+
+    match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => kill_zero_stderr_indicates_live_process(&output.stderr),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn kill_zero_stderr_indicates_live_process(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("operation not permitted")
 }
 
 #[cfg(windows)]
@@ -1527,7 +1559,7 @@ fn terminate_process(pid: u32) -> Result<(), String> {
 fn process_command_line(pid: u32) -> Option<String> {
     let pid = pid.to_string();
     let output = Command::new("ps")
-        .args(["-p", pid.as_str(), "-o", "command="])
+        .args(["-ww", "-p", pid.as_str(), "-o", "command="])
         .output()
         .ok()?;
 
@@ -1696,6 +1728,39 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lock_fallback_mismatched_live_identity_is_unverified() {
+        for issue in [
+            StateFileIssue::Missing,
+            StateFileIssue::Invalid("bad state".to_owned()),
+        ] {
+            let dir = temp_test_dir("lock-fallback-mismatch");
+            let paths = DaemonPaths::new(&dir);
+            fs::create_dir_all(&dir).expect("test dir should be created");
+            let record = DaemonRecord::new(
+                process::id(),
+                "token-not-in-command-line".to_owned(),
+                "/not/the/current/exe".to_owned(),
+                MODE_BACKGROUND,
+            );
+            write_record(&paths.lock_file, &record).expect("lock should be written");
+
+            match inspect_lock_without_state(&paths, issue) {
+                DaemonStatus::RunningUnverified {
+                    record: actual,
+                    reason,
+                } => {
+                    assert_eq!(actual, record);
+                    assert!(reason.contains("daemon state"));
+                    assert!(reason.contains("process command line does not match"));
+                }
+                other => panic!("expected running unverified fallback, got {other:?}"),
+            }
+
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -1922,7 +1987,8 @@ mod tests {
         let dir = temp_test_dir("incomplete-lifecycle-lock");
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
-        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        fs::write(&lock_file, format!("pid={}\n", dead_test_pid()))
+            .expect("incomplete lock should be written");
         mark_file_stale(&lock_file);
         let snapshot = FileSnapshot::from_path(&lock_file)
             .expect("snapshot should read")
@@ -1965,7 +2031,8 @@ mod tests {
         let dir = temp_test_dir("incomplete-lifecycle-lock-replaced");
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
-        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        fs::write(&lock_file, format!("pid={}\n", dead_test_pid()))
+            .expect("incomplete lock should be written");
         mark_file_stale(&lock_file);
         let old_snapshot = FileSnapshot::from_path(&lock_file)
             .expect("snapshot should read")
@@ -1995,7 +2062,8 @@ mod tests {
         let paths = DaemonPaths::new(&dir);
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
-        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        fs::write(&lock_file, format!("pid={}\n", dead_test_pid()))
+            .expect("incomplete lock should be written");
 
         mark_file_stale(&lock_file);
 
@@ -2137,12 +2205,29 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn kill_zero_permission_denied_still_means_process_exists() {
+        assert!(kill_zero_stderr_indicates_live_process(
+            b"kill: 123: Operation not permitted\n"
+        ));
+        assert!(!kill_zero_stderr_indicates_live_process(
+            b"kill: 123: No such process\n"
+        ));
+    }
+
     fn temp_test_dir(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "{NAME}-{name}-{}-{}",
             process::id(),
             generate_token()
         ))
+    }
+
+    fn dead_test_pid() -> u32 {
+        let pid = u32::MAX;
+        assert!(!is_process_running(pid), "test pid should not be live");
+        pid
     }
 
     #[cfg(unix)]
