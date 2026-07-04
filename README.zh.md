@@ -58,6 +58,8 @@ cargo run -- stop
 
 ## 构建与测试
 
+需要 Rust 1.85 或更新版本。
+
 ```bash
 cargo build
 cargo test
