@@ -8,7 +8,9 @@
 
 ## 状态
 
-🚧 早期开发中。已发布的 `0.1.0` 版本提供本地 daemon lifecycle commands，runtime 和 adapter 集成会在后续阶段推进。
+🚧 早期开发中。已发布的 `0.1.0` 版本提供本地 daemon lifecycle commands。`main` 分支现在也已经包含 runtime foundation modules：versioned config、runtime state storage、stable sessions、平台无关 message/event models、structured logging、redaction 和 runtime error classes。
+
+下一个功能里程碑是 runtime orchestrator。真实 chat platform adapters 和真实 agent adapters 仍属于后续里程碑。
 
 ## 目标
 

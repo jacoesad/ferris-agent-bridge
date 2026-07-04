@@ -8,7 +8,9 @@ A Rust-first bridge for local AI agents to chat platforms.
 
 ## Status
 
-🚧 Early development. The published `0.1.0` release provides local daemon lifecycle commands before runtime and adapter integration.
+🚧 Early development. The published `0.1.0` release provides local daemon lifecycle commands. The `main` branch now also contains the runtime foundation modules: versioned config, runtime state storage, stable sessions, platform-neutral message/event models, structured logging, redaction, and runtime error classes.
+
+The next feature milestone is the runtime orchestrator. Real chat platform adapters and real agent adapters remain later milestones.
 
 ## Goals
 
