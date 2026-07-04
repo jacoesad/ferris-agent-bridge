@@ -205,12 +205,15 @@ fn secret_value_span(input: &str, value_start: usize, key: &str) -> (usize, usiz
         return (inner_start, inner_end);
     }
 
-    let first_token_end = next_token_end(input, value_start);
+    let first_token_end = next_unquoted_value_end(input, value_start);
 
     if key == "authorization" && first_token_end < input.len() {
         let second_token_start = skip_whitespace(input, first_token_end);
         if second_token_start > first_token_end {
-            return (value_start, next_token_end(input, second_token_start));
+            return (
+                value_start,
+                next_unquoted_value_end(input, second_token_start),
+            );
         }
     }
 
@@ -283,11 +286,16 @@ fn escaped_quote_is_closing(input: &str, candidate: usize, escaped_quote: &str) 
             .is_none_or(|char| char != '\\')
 }
 
-fn next_token_end(input: &str, start: usize) -> usize {
+fn next_unquoted_value_end(input: &str, start: usize) -> usize {
     input[start..]
-        .find(char::is_whitespace)
-        .map(|offset| start + offset)
+        .char_indices()
+        .find(|(_, char)| is_unquoted_value_delimiter(*char))
+        .map(|(offset, _)| start + offset)
         .unwrap_or(input.len())
+}
+
+fn is_unquoted_value_delimiter(char: char) -> bool {
+    char.is_whitespace() || matches!(char, ',' | ';' | '}' | ']')
 }
 
 fn skip_whitespace(input: &str, start: usize) -> usize {
@@ -370,6 +378,14 @@ mod tests {
     }
 
     #[test]
+    fn redacts_json_secret_values_next_to_other_fields() {
+        let line = Redactor::default().redact_value(r#"{"token":"abc","chat":"1"}"#);
+
+        assert_eq!(line, r#"{"token":"[REDACTED]","chat":"1"}"#);
+        assert!(!line.contains("abc"));
+    }
+
+    #[test]
     fn redacts_secret_like_inline_key_names() {
         let line = Redactor::default().redact_value(
             "loaded app_secret=abc123 accessToken=tok456 appSecret=sec789 secret_key=key123 token_id=tid456 passwordHash=hash789 tokenValue=tval012",
@@ -424,16 +440,25 @@ mod tests {
     }
 
     #[test]
-    fn redacts_unquoted_inline_secret_values_until_whitespace() {
-        let line = Redactor::default().redact_value("token=abc,def password=pw;tail visible=value");
+    fn redacts_unquoted_inline_secret_values_until_field_delimiters() {
+        let line = Redactor::default()
+            .redact_value("token=abc,chat=1 password=pw;visible=value secret=hidden]tail");
 
-        assert!(line.contains("token=[REDACTED]"));
-        assert!(line.contains("password=[REDACTED]"));
+        assert!(line.contains("token=[REDACTED],chat=1"));
+        assert!(line.contains("password=[REDACTED];visible=value"));
+        assert!(line.contains("secret=[REDACTED]]tail"));
         assert!(line.contains("visible=value"));
         assert!(!line.contains("abc"));
-        assert!(!line.contains("def"));
         assert!(!line.contains("pw"));
-        assert!(!line.contains("tail"));
+        assert!(!line.contains("hidden"));
+    }
+
+    #[test]
+    fn redacts_comma_separated_inline_secret_without_swallowing_next_field() {
+        let line = Redactor::default().redact_value("token=abc,chat=1");
+
+        assert_eq!(line, "token=[REDACTED],chat=1");
+        assert!(!line.contains("abc"));
     }
 
     #[test]

@@ -122,7 +122,7 @@ impl Session {
     }
 
     pub fn touch(&mut self) {
-        self.updated_at_unix = unix_seconds_now();
+        self.touch_at(unix_seconds_now());
     }
 
     pub(crate) fn refresh_from(&mut self, replacement: Self) {
@@ -130,6 +130,10 @@ impl Session {
         debug_assert_eq!(self.scope, replacement.scope);
 
         self.updated_at_unix = self.updated_at_unix.max(replacement.updated_at_unix);
+    }
+
+    fn touch_at(&mut self, updated_at_unix: u64) {
+        self.updated_at_unix = self.updated_at_unix.max(updated_at_unix);
     }
 
     pub fn id(&self) -> &SessionId {
@@ -261,6 +265,23 @@ mod tests {
             .expect_err("invalid session id json should fail");
 
         assert!(err.to_string().contains("invalid session id"));
+    }
+
+    #[test]
+    fn touch_does_not_move_updated_at_backwards() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let mut session = Session {
+            id: SessionId::for_scope(&scope),
+            scope,
+            created_at_unix: 1,
+            updated_at_unix: 100,
+        };
+
+        session.touch_at(90);
+        assert_eq!(session.updated_at_unix(), 100);
+
+        session.touch_at(101);
+        assert_eq!(session.updated_at_unix(), 101);
     }
 
     #[test]
