@@ -117,19 +117,8 @@ fn redact_inline_key_values(input: &str, key: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut cursor = 0;
 
-    while let Some(match_start) = find_next_marker(input, key, cursor) {
-        let delimiter_index = match_start + key.len();
-        let mut value_start = delimiter_index + 1;
-
-        while let Some(char) = input[value_start..].chars().next() {
-            if !char.is_whitespace() {
-                break;
-            }
-
-            value_start += char.len_utf8();
-        }
-
-        let value_end = secret_value_end(input, value_start, key);
+    while let Some(marker) = find_next_marker(input, key, cursor) {
+        let (value_start, value_end) = secret_value_span(input, marker.value_start, key);
         output.push_str(&input[cursor..value_start]);
         output.push_str("[REDACTED]");
         cursor = value_end;
@@ -139,21 +128,34 @@ fn redact_inline_key_values(input: &str, key: &str) -> String {
     output
 }
 
-fn find_next_marker(input: &str, key: &str, start: usize) -> Option<usize> {
+struct InlineSecretMarker {
+    value_start: usize,
+}
+
+fn find_next_marker(input: &str, key: &str, start: usize) -> Option<InlineSecretMarker> {
     let lower = input.to_ascii_lowercase();
     let mut cursor = start;
 
     while cursor < input.len() {
         let relative_index = lower[cursor..].find(key)?;
         let match_start = cursor + relative_index;
-        let delimiter_index = match_start + key.len();
+        let mut delimiter_index = match_start + key.len();
+
+        let Some(suffix_end) = skip_inline_key_suffix(input, delimiter_index) else {
+            cursor = delimiter_index;
+            continue;
+        };
+        delimiter_index = suffix_end;
+        delimiter_index = skip_optional_quote(input, delimiter_index);
+        delimiter_index = skip_whitespace(input, delimiter_index);
 
         if input[delimiter_index..]
             .chars()
             .next()
             .is_some_and(|char| matches!(char, '=' | ':'))
         {
-            return Some(match_start);
+            let value_start = skip_whitespace(input, delimiter_index + 1);
+            return Some(InlineSecretMarker { value_start });
         }
 
         cursor = delimiter_index;
@@ -162,18 +164,123 @@ fn find_next_marker(input: &str, key: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn secret_value_end(input: &str, value_start: usize, key: &str) -> usize {
-    let first_token_end = next_token_end(input, value_start);
+fn skip_inline_key_suffix(input: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
 
-    if key == "authorization"
-        && input[value_start..first_token_end].eq_ignore_ascii_case("bearer")
-        && first_token_end < input.len()
-    {
-        let second_token_start = skip_whitespace(input, first_token_end);
-        return next_token_end(input, second_token_start);
+    while let Some(char) = input[cursor..].chars().next() {
+        if char.is_whitespace() {
+            return None;
+        }
+
+        if matches!(char, '=' | ':') || char == '"' || char == '\'' {
+            break;
+        }
+
+        if input[cursor..].starts_with("\\\"") || input[cursor..].starts_with("\\'") {
+            break;
+        }
+
+        cursor += char.len_utf8();
     }
 
-    first_token_end
+    Some(cursor)
+}
+
+fn skip_optional_quote(input: &str, start: usize) -> usize {
+    if input[start..].starts_with("\\\"") || input[start..].starts_with("\\'") {
+        start + 2
+    } else if input[start..]
+        .chars()
+        .next()
+        .is_some_and(|char| matches!(char, '"' | '\''))
+    {
+        start + 1
+    } else {
+        start
+    }
+}
+
+fn secret_value_span(input: &str, value_start: usize, key: &str) -> (usize, usize) {
+    if let Some((inner_start, inner_end)) = quoted_value_span(input, value_start) {
+        return (inner_start, inner_end);
+    }
+
+    let first_token_end = next_token_end(input, value_start);
+
+    if key == "authorization" && first_token_end < input.len() {
+        let second_token_start = skip_whitespace(input, first_token_end);
+        if second_token_start > first_token_end {
+            return (value_start, next_token_end(input, second_token_start));
+        }
+    }
+
+    (value_start, first_token_end)
+}
+
+fn quoted_value_span(input: &str, value_start: usize) -> Option<(usize, usize)> {
+    if let Some(span) = escaped_quoted_value_span(input, value_start, "\\\"") {
+        return Some(span);
+    }
+
+    if let Some(span) = escaped_quoted_value_span(input, value_start, "\\'") {
+        return Some(span);
+    }
+
+    let quote = input[value_start..].chars().next()?;
+    if !matches!(quote, '"' | '\'') {
+        return None;
+    }
+
+    let inner_start = value_start + quote.len_utf8();
+    let mut cursor = inner_start;
+
+    while let Some(char) = input[cursor..].chars().next() {
+        if char == quote {
+            return Some((inner_start, cursor));
+        }
+
+        cursor += char.len_utf8();
+
+        if char == '\\'
+            && let Some(escaped) = input[cursor..].chars().next()
+        {
+            cursor += escaped.len_utf8();
+        }
+    }
+
+    Some((inner_start, input.len()))
+}
+
+fn escaped_quoted_value_span(
+    input: &str,
+    value_start: usize,
+    escaped_quote: &str,
+) -> Option<(usize, usize)> {
+    if !input[value_start..].starts_with(escaped_quote) {
+        return None;
+    }
+
+    let inner_start = value_start + escaped_quote.len();
+    let mut cursor = inner_start;
+
+    while let Some(offset) = input[cursor..].find(escaped_quote) {
+        let candidate = cursor + offset;
+        if escaped_quote_is_closing(input, candidate, escaped_quote) {
+            return Some((inner_start, candidate));
+        }
+
+        cursor = candidate + escaped_quote.len();
+    }
+
+    Some((inner_start, input.len()))
+}
+
+fn escaped_quote_is_closing(input: &str, candidate: usize, escaped_quote: &str) -> bool {
+    input[candidate..].starts_with(escaped_quote)
+        && input[..candidate]
+            .chars()
+            .next_back()
+            .is_none_or(|char| char != '\\')
 }
 
 fn next_token_end(input: &str, start: usize) -> usize {
@@ -228,6 +335,189 @@ mod tests {
         assert!(line.contains("Authorization: [REDACTED] for chat"));
         assert!(!line.contains("Bearer"));
         assert!(!line.contains("abc123"));
+    }
+
+    #[test]
+    fn redacts_authorization_basic_values() {
+        let line =
+            Redactor::default().redact_value("request failed Authorization: Basic abc123 for chat");
+
+        assert!(line.contains("Authorization: [REDACTED] for chat"));
+        assert!(!line.contains("Basic"));
+        assert!(!line.contains("abc123"));
+    }
+
+    #[test]
+    fn redacts_authorization_unknown_two_part_values() {
+        let line = Redactor::default()
+            .redact_value("request failed Authorization: ApiKey abc123 for chat");
+
+        assert!(line.contains("Authorization: [REDACTED] for chat"));
+        assert!(!line.contains("ApiKey"));
+        assert!(!line.contains("abc123"));
+    }
+
+    #[test]
+    fn redacts_json_style_secret_values() {
+        let line = Redactor::default()
+            .redact_value(r#"payload {"token":"abc123","visible":"ok","password": "pw456"}"#);
+
+        assert!(line.contains(r#""token":"[REDACTED]""#));
+        assert!(line.contains(r#""visible":"ok""#));
+        assert!(line.contains(r#""password": "[REDACTED]""#));
+        assert!(!line.contains("abc123"));
+        assert!(!line.contains("pw456"));
+    }
+
+    #[test]
+    fn redacts_secret_like_inline_key_names() {
+        let line = Redactor::default().redact_value(
+            "loaded app_secret=abc123 accessToken=tok456 appSecret=sec789 secret_key=key123 token_id=tid456 passwordHash=hash789 tokenValue=tval012",
+        );
+
+        assert!(line.contains("app_secret=[REDACTED]"));
+        assert!(line.contains("accessToken=[REDACTED]"));
+        assert!(line.contains("appSecret=[REDACTED]"));
+        assert!(line.contains("secret_key=[REDACTED]"));
+        assert!(line.contains("token_id=[REDACTED]"));
+        assert!(line.contains("passwordHash=[REDACTED]"));
+        assert!(line.contains("tokenValue=[REDACTED]"));
+        assert!(!line.contains("abc123"));
+        assert!(!line.contains("tok456"));
+        assert!(!line.contains("sec789"));
+        assert!(!line.contains("key123"));
+        assert!(!line.contains("tid456"));
+        assert!(!line.contains("hash789"));
+        assert!(!line.contains("tval012"));
+    }
+
+    #[test]
+    fn redacts_secret_like_inline_key_names_with_unicode_suffixes() {
+        let line = Redactor::default().redact_value("token名=abc123 visible=value");
+
+        assert!(line.contains("token名=[REDACTED]"));
+        assert!(line.contains("visible=value"));
+        assert!(!line.contains("abc123"));
+    }
+
+    #[test]
+    fn redacts_secret_like_inline_key_names_with_symbol_suffixes() {
+        let line = Redactor::default()
+            .redact_value("token[]=abc123 token/type=tok456 password[hash]=pw789");
+
+        assert!(line.contains("token[]=[REDACTED]"));
+        assert!(line.contains("token/type=[REDACTED]"));
+        assert!(line.contains("password[hash]=[REDACTED]"));
+        assert!(!line.contains("abc123"));
+        assert!(!line.contains("tok456"));
+        assert!(!line.contains("pw789"));
+    }
+
+    #[test]
+    fn redacts_authorization_like_inline_key_names() {
+        let line =
+            Redactor::default().redact_value("authorizationHeader=ApiKey abc123 visible=value");
+
+        assert!(line.contains("authorizationHeader=[REDACTED] visible=value"));
+        assert!(!line.contains("ApiKey"));
+        assert!(!line.contains("abc123"));
+    }
+
+    #[test]
+    fn redacts_unquoted_inline_secret_values_until_whitespace() {
+        let line = Redactor::default().redact_value("token=abc,def password=pw;tail visible=value");
+
+        assert!(line.contains("token=[REDACTED]"));
+        assert!(line.contains("password=[REDACTED]"));
+        assert!(line.contains("visible=value"));
+        assert!(!line.contains("abc"));
+        assert!(!line.contains("def"));
+        assert!(!line.contains("pw"));
+        assert!(!line.contains("tail"));
+    }
+
+    #[test]
+    fn does_not_cross_whitespace_after_inline_secret_marker() {
+        let line = Redactor::default().redact_value("token label token=abc123 visible=value");
+
+        assert!(line.contains("token label token=[REDACTED]"));
+        assert!(line.contains("visible=value"));
+        assert!(!line.contains("abc123"));
+    }
+
+    #[test]
+    fn redacts_escaped_json_style_secret_values() {
+        let line = Redactor::default().redact_value(
+            r#"payload {\"token\":\"abc123\",\"apiToken\":\"tok456\",\"token/type\":\"tok789\",\"visible\":\"ok\"}"#,
+        );
+
+        assert!(line.contains(r#"\"token\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"apiToken\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"token/type\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"visible\":\"ok\""#));
+        assert!(!line.contains("abc123"));
+        assert!(!line.contains("tok456"));
+        assert!(!line.contains("tok789"));
+    }
+
+    #[test]
+    fn redacts_escaped_json_secret_values_with_escaped_quotes() {
+        let line = Redactor::default()
+            .redact_value(r#"payload {\"password\":\"one\\\"two\",\"visible\":\"ok\"}"#);
+
+        assert!(line.contains(r#"\"password\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"visible\":\"ok\""#));
+        assert!(!line.contains("one"));
+        assert!(!line.contains("two"));
+    }
+
+    #[test]
+    fn redacts_escaped_json_secret_values_with_escaped_quotes_before_commas() {
+        let line = Redactor::default()
+            .redact_value(r#"payload {\"password\":\"one\\\",two\",\"visible\":\"ok\"}"#);
+
+        assert!(line.contains(r#"\"password\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"visible\":\"ok\""#));
+        assert!(!line.contains("one"));
+        assert!(!line.contains("two"));
+    }
+
+    #[test]
+    fn redacts_escaped_json_secret_values_with_escaped_quotes_before_closing_quotes() {
+        let line = Redactor::default()
+            .redact_value(r#"payload {\"password\":\"one\\\",\",\"visible\":\"ok\"}"#);
+
+        assert!(line.contains(r#"\"password\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"visible\":\"ok\""#));
+        assert!(!line.contains("one"));
+    }
+
+    #[test]
+    fn redacts_escaped_json_secret_values_with_escaped_quotes_before_structural_chars() {
+        let line = Redactor::default().redact_value(
+            r#"payload {\"password\":\"one\\\"}two\",\"token\":\"needle\\\",]more\",\"secret\":\"hidden\\\",}tail\",\"visible\":\"ok\"}"#,
+        );
+
+        assert!(line.contains(r#"\"password\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"token\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"secret\":\"[REDACTED]\""#));
+        assert!(line.contains(r#"\"visible\":\"ok\""#));
+        assert!(!line.contains("one"));
+        assert!(!line.contains("two"));
+        assert!(!line.contains("needle"));
+        assert!(!line.contains("more"));
+        assert!(!line.contains("hidden"));
+        assert!(!line.contains("tail"));
+    }
+
+    #[test]
+    fn redacts_escaped_json_secret_values_ending_with_backslash() {
+        let line = Redactor::default()
+            .redact_value(r#"payload {\"password\":\"one\\\",\"visible\":\"ok\"}"#);
+
+        assert!(line.contains(r#"\"password\":\"[REDACTED]"#));
+        assert!(line.contains("visible"));
+        assert!(!line.contains("one"));
     }
 
     #[test]
