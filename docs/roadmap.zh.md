@@ -10,7 +10,7 @@
 
 - `v0.0.1` 建立了初始 Rust CLI、package metadata、README、架构说明、license 和 changelog。
 - Milestone 1 已交付本地 daemon lifecycle：前台 `run`、后台 `start`、`status`、`stop`、本地 runtime 文件、带 ownership 的 lock、stale recovery 和 daemon lifecycle 测试（#2）。该里程碑已作为 `v0.1.0` 发布（#3）。
-- Milestone 2 已在 `main` 实现：versioned config、runtime state storage、stable sessions、平台无关 message/event models、structured logging、redaction 和 runtime error classes（#4）。`v0.2.0` release preparation 还没有切分支。
+- Milestone 2 加入 versioned config、runtime state storage、stable sessions、平台无关 message/event models、structured logging、redaction 和 runtime error classes（#4）。这些内容包含在版本 `0.2.0` 中。
 
 下一个功能里程碑是 Milestone 3，即 runtime orchestrator。它应通过聚焦 PR 逐步交付，而不是放进一个过大的分支。
 
@@ -72,7 +72,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 
 设计说明：[0.2 Runtime Foundations 设计](design/0.2-runtime-foundations.zh.md)。
 
-状态：已在 `main` 实现；`v0.2.0` release preparation 待处理。
+状态：已完成，并包含在版本 `0.2.0` 中。
 
 - Versioned local config 和 profile loading（#4）
 - 面向未来 keystore-backed secret sources 的 `SecretInput` 占位（#4）

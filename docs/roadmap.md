@@ -10,7 +10,7 @@ The project has completed the local daemon foundation and runtime foundation wor
 
 - `v0.0.1` established the initial Rust CLI, package metadata, README, architecture notes, licenses, and changelog.
 - Milestone 1 shipped the local daemon lifecycle: foreground `run`, background `start`, `status`, `stop`, local runtime files, ownership-aware locks, stale recovery, and daemon lifecycle tests (#2). It was released as `v0.1.0` (#3).
-- Milestone 2 is implemented on `main`: versioned config, runtime state storage, stable sessions, platform-neutral message/event models, structured logging, redaction, and runtime error classes (#4). The `v0.2.0` release preparation has not been cut yet.
+- Milestone 2 added versioned config, runtime state storage, stable sessions, platform-neutral message/event models, structured logging, redaction, and runtime error classes (#4). It is included in version `0.2.0`.
 
 The next feature milestone is Milestone 3, the runtime orchestrator. It should be delivered through focused PRs rather than one large branch.
 
@@ -72,7 +72,7 @@ Status: complete, released as `v0.1.0`.
 
 Design note: [0.2 Runtime Foundations Design](design/0.2-runtime-foundations.md).
 
-Status: implemented on `main`; `v0.2.0` release preparation is pending.
+Status: complete, included in version `0.2.0`.
 
 - Versioned local config and profile loading (#4)
 - `SecretInput` placeholder for future keystore-backed secret sources (#4)
