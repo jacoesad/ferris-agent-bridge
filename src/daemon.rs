@@ -1987,7 +1987,8 @@ mod tests {
         let dir = temp_test_dir("incomplete-lifecycle-lock");
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
-        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        fs::write(&lock_file, format!("pid={}\n", dead_test_pid()))
+            .expect("incomplete lock should be written");
         mark_file_stale(&lock_file);
         let snapshot = FileSnapshot::from_path(&lock_file)
             .expect("snapshot should read")
@@ -2030,7 +2031,8 @@ mod tests {
         let dir = temp_test_dir("incomplete-lifecycle-lock-replaced");
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
-        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        fs::write(&lock_file, format!("pid={}\n", dead_test_pid()))
+            .expect("incomplete lock should be written");
         mark_file_stale(&lock_file);
         let old_snapshot = FileSnapshot::from_path(&lock_file)
             .expect("snapshot should read")
@@ -2060,7 +2062,8 @@ mod tests {
         let paths = DaemonPaths::new(&dir);
         fs::create_dir_all(&dir).expect("test dir should be created");
         let lock_file = dir.join(LIFECYCLE_LOCK_FILE);
-        fs::write(&lock_file, "pid=123\n").expect("incomplete lock should be written");
+        fs::write(&lock_file, format!("pid={}\n", dead_test_pid()))
+            .expect("incomplete lock should be written");
 
         mark_file_stale(&lock_file);
 
@@ -2219,6 +2222,12 @@ mod tests {
             process::id(),
             generate_token()
         ))
+    }
+
+    fn dead_test_pid() -> u32 {
+        let pid = u32::MAX;
+        assert!(!is_process_running(pid), "test pid should not be live");
+        pid
     }
 
     #[cfg(unix)]
