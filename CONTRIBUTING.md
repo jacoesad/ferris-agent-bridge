@@ -7,7 +7,11 @@ Thanks for considering contributing! This document outlines the development work
 - `main`: stable branch, always buildable. Direct commits are not allowed.
 - `feat/*`: new features (for example, `feat/daemon-foundation`).
 - `fix/*`: bug fixes (for example, `fix/start-command-pid`).
-- `release/*`: release preparation (optional, for multi-contributor scenarios).
+- `docs/*`: documentation-only changes (for example, `docs/restructure-roadmap`).
+- `ci/*`: workflow changes (for example, `ci/rust-checks`).
+- `chore/*`: project maintenance (for example, `chore/update-metadata`).
+- `refactor/*`: behavior-preserving code changes (for example, `refactor/runtime-state-store`).
+- `release/*`: release preparation (for example, `release/0.2.0`).
 
 ## Commit Messages
 
@@ -54,10 +58,9 @@ External SDK-style projects should normally stay as external dependencies. For e
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-- If a `release/*` branch exists: update the `Cargo.toml` version and `CHANGELOG.md` in the `release/*` branch, just before tagging.
-- If no `release/*` branch exists, which is the default for single-contributor work: update the `Cargo.toml` version and `CHANGELOG.md` as the final change before opening or merging the PR.
+For milestone releases, finalize version information in a dedicated `release/<version>` branch and release PR. Keep ordinary feature PRs focused on the delivered capability; do not mix feature work with release-only version and changelog updates.
 
-General rule: version information must be finalized before a release tag is created.
+Release preparation should update `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` before the release PR is merged. General rule: version information must be finalized before a release tag is created.
 
 ## Release Process
 

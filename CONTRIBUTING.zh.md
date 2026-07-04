@@ -7,7 +7,11 @@
 - `main`：稳定分支，必须始终可构建。禁止直接提交。
 - `feat/*`：新功能，例如 `feat/daemon-foundation`。
 - `fix/*`：问题修复，例如 `fix/start-command-pid`。
-- `release/*`：发布准备分支，可选，适用于多人协作场景。
+- `docs/*`：仅文档变更，例如 `docs/restructure-roadmap`。
+- `ci/*`：工作流变更，例如 `ci/rust-checks`。
+- `chore/*`：项目维护，例如 `chore/update-metadata`。
+- `refactor/*`：不改变行为的代码重构，例如 `refactor/runtime-state-store`。
+- `release/*`：发布准备分支，例如 `release/0.2.0`。
 
 ## 提交信息
 
@@ -54,10 +58,9 @@ docs: add roadmap and contribution workflow
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-- 如果存在 `release/*` 分支：在 `release/*` 分支中更新 `Cargo.toml` 版本和 `CHANGELOG.md`，然后再打 tag。
-- 如果不存在 `release/*` 分支，这也是单人维护时的默认流程：在打开或合并 PR 前，把版本和 `CHANGELOG.md` 作为最后一项变更更新。
+Milestone release 应在独立的 `release/<version>` 分支和 release PR 中确定版本信息。普通 feature PR 应聚焦交付的能力，不要把功能变更和仅用于发布的版本、changelog 更新混在一起。
 
-通用规则：创建发布 tag 前，必须先确定版本信息。
+发布准备应在 release PR 合并前更新 `Cargo.toml`、`Cargo.lock` 和 `CHANGELOG.md`。通用规则：创建发布 tag 前，必须先确定版本信息。
 
 ## 发布流程
 
