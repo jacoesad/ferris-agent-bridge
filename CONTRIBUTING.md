@@ -62,6 +62,16 @@ For milestone releases, finalize version information in a dedicated `release/<ve
 
 Release preparation should update `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` before the release PR is merged. General rule: version information must be finalized before a release tag is created.
 
+## Minimum Supported Rust Version
+
+The current minimum supported Rust version is declared in `Cargo.toml` through `rust-version`, documented in `README.md` and `README.zh.md`, and checked by the `MSRV` CI job.
+
+When changing the MSRV, update all of these places in the same PR and verify with:
+
+```bash
+cargo +<version> check --locked --all-targets --all-features
+```
+
 ## Release Process
 
 Prepare releases on short `release/<version>` branches cut from the latest `main`.

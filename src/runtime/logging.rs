@@ -244,10 +244,10 @@ fn quoted_value_span(input: &str, value_start: usize) -> Option<(usize, usize)> 
 
         cursor += char.len_utf8();
 
-        if char == '\\'
-            && let Some(escaped) = input[cursor..].chars().next()
-        {
-            cursor += escaped.len_utf8();
+        if char == '\\' {
+            if let Some(escaped) = input[cursor..].chars().next() {
+                cursor += escaped.len_utf8();
+            }
         }
     }
 

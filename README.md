@@ -58,6 +58,8 @@ Set `FERRIS_AGENT_BRIDGE_HOME` to override the default runtime directory at `~/.
 
 ## Building and Testing
 
+Requires Rust 1.85 or newer.
+
 ```bash
 cargo build
 cargo test
