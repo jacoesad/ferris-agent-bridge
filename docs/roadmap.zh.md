@@ -88,18 +88,20 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 
 ## Milestone 3: Runtime Orchestrator
 
+设计说明：[0.3 Runtime Orchestrator 设计](design/0.3-runtime-orchestrator.zh.md)。
+
 目标：在 runtime foundations 之上加入 durable orchestration，但暂不加入真实 IM 或 agent 实现。
 
 - 用于重复投递处理的 durable inbound event ledger（#9）
-- Inbound events 的 store-level ack-after-persist persistence primitive
-- 通过 `ImAdapter` 和 runtime orchestrator 边界接入显式 transport acknowledgement
+- Inbound events 的 store-level ack-after-persist persistence primitive（#11）
+- 通过初始 `ImAdapter` 和 runtime orchestrator intake 边界接入显式 transport acknowledgement
 - 用于可靠回复投递的 durable outbound outbox
 - Per-scope message queue，包含 debounce 和 batching
 - Scope 级互斥：同一个 scope 同时最多一个 active run
 - Startup recovery，将 pending、running 和 failed runs 恢复为显式状态
 - Workspace policy skeleton，并让 decisions 可测试
 - Access policy skeleton，并让 decisions 可测试
-- `ImAdapter` 和 `AgentAdapter` capability traits
+- 剩余 `ImAdapter` 能力和 `AgentAdapter` capability traits
 - 具体 runtime orchestrator，用于串联 storage、queues、policies 和 adapter boundaries
 - Runtime-level tests，证明 duplicate handling、queueing、recovery 和 policy decisions
 

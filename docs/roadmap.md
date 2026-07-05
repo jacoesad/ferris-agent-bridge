@@ -88,18 +88,20 @@ Status: version `0.2.0` shipped the foundation; post-`0.2.0` M2 hardening contin
 
 ## Milestone 3: Runtime Orchestrator
 
+Design note: [0.3 Runtime Orchestrator Design](design/0.3-runtime-orchestrator.md).
+
 Goal: layer durable orchestration on top of the runtime foundations without adding real IM or agent implementations yet.
 
 - Durable inbound event ledger for duplicate delivery handling (#9)
-- Store-level ack-after-persist persistence primitive for inbound events
-- Explicit transport acknowledgement wiring through `ImAdapter` and runtime orchestrator boundaries
+- Store-level ack-after-persist persistence primitive for inbound events (#11)
+- Explicit transport acknowledgement wiring through the initial `ImAdapter` and runtime orchestrator intake boundary
 - Durable outbound outbox for reliable reply delivery
 - Per-scope message queue with debounce and batching
 - Scope-level mutual exclusion: at most one active run per scope
 - Startup recovery for pending, running, and failed runs into explicit states
 - Workspace policy skeleton with testable decisions
 - Access policy skeleton with testable decisions
-- `ImAdapter` and `AgentAdapter` capability traits
+- Remaining `ImAdapter` capabilities and `AgentAdapter` capability traits
 - Concrete runtime orchestrator that wires storage, queues, policies, and adapter boundaries
 - Runtime-level tests that prove duplicate handling, queueing, recovery, and policy decisions
 
