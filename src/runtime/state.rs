@@ -253,6 +253,21 @@ impl RuntimeState {
     fn touch_at(&mut self, updated_at_unix: u64) {
         self.updated_at_unix = self.updated_at_unix.max(updated_at_unix);
     }
+
+    fn normalize_migrated_aggregate_updated_at(&mut self) {
+        let updated_at_unix = self
+            .sessions
+            .iter()
+            .map(Session::updated_at_unix)
+            .chain(self.runs.iter().map(RunRecord::updated_at_unix))
+            .chain(
+                self.inbound_events
+                    .iter()
+                    .map(InboundEventRecord::recorded_at_unix),
+            )
+            .fold(self.updated_at_unix, u64::max);
+        self.updated_at_unix = updated_at_unix;
+    }
 }
 
 impl Default for RuntimeState {
@@ -322,7 +337,7 @@ struct RuntimeStateFileWire {
 
 impl RuntimeStateFileWire {
     fn into_state(self) -> Result<RuntimeState, String> {
-        let (runs, inbound_events) = match self.version {
+        let (runs, inbound_events, normalize_aggregate_updated_at) = match self.version {
             RUNTIME_STATE_FILE_V1_VERSION => {
                 if self.runs.is_present() {
                     return Err("runtime state version 1 must not contain run records".to_string());
@@ -335,7 +350,7 @@ impl RuntimeStateFileWire {
                     );
                 }
 
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), true)
             }
             RUNTIME_STATE_FILE_V2_VERSION => {
                 let runs = self
@@ -349,7 +364,7 @@ impl RuntimeStateFileWire {
                     );
                 }
 
-                (runs, Vec::new())
+                (runs, Vec::new(), true)
             }
             RUNTIME_STATE_FILE_VERSION => {
                 let runs = self.runs.into_required(format!(
@@ -359,7 +374,7 @@ impl RuntimeStateFileWire {
                     "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain inbound event records"
                 ))?;
 
-                (runs, inbound_events)
+                (runs, inbound_events, false)
             }
             version => {
                 return Err(format!(
@@ -368,12 +383,15 @@ impl RuntimeStateFileWire {
                 ));
             }
         };
-        let state = RuntimeState {
+        let mut state = RuntimeState {
             sessions: self.sessions,
             runs,
             inbound_events,
             updated_at_unix: self.updated_at_unix,
         };
+        if normalize_aggregate_updated_at {
+            state.normalize_migrated_aggregate_updated_at();
+        }
         state.validate()?;
         Ok(state)
     }
@@ -996,6 +1014,31 @@ mod tests {
     }
 
     #[test]
+    fn state_load_migrates_version_1_stale_aggregate_updated_at() {
+        let path = test_path("state-v1-stale-aggregate-updated-at").join("runtime.state.json");
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 20);
+        let encoded = format!(
+            r#"{{
+                "version": 1,
+                "sessions": [{session}],
+                "updated_at_unix": 1
+            }}"#,
+            session = serde_json::to_string(&session).expect("session should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 1 state should normalize aggregate timestamps while migrating");
+
+        assert_eq!(state.updated_at_unix(), 20);
+        assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+    }
+
+    #[test]
     fn state_load_rejects_version_1_with_run_records() {
         let path = test_path("state-v1-with-runs").join("runtime.state.json");
         fs::write(
@@ -1081,6 +1124,38 @@ mod tests {
             .expect("version 2 state without inbound event records should migrate");
 
         assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+    }
+
+    #[test]
+    fn state_load_migrates_version_2_stale_aggregate_updated_at() {
+        let path = test_path("state-v2-stale-aggregate-updated-at").join("runtime.state.json");
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 2);
+        let run = RunRecord::new(
+            RunId::new("run_1").expect("valid run id"),
+            session.id().clone(),
+            20,
+        );
+        let encoded = format!(
+            r#"{{
+                "version": 2,
+                "sessions": [{session}],
+                "runs": [{run}],
+                "updated_at_unix": 1
+            }}"#,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            run = serde_json::to_string(&run).expect("run should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 2 state should normalize aggregate timestamps while migrating");
+
+        assert_eq!(state.updated_at_unix(), 20);
+        assert_eq!(state.runs().len(), 1);
         assert!(state.inbound_events().is_empty());
     }
 
