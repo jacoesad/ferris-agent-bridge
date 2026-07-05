@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeSet,
-    fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -17,13 +16,7 @@ use super::{
     session::{Session, SessionId},
 };
 
-pub const RUNTIME_STATE_FILE_VERSION: u32 = 3;
-#[deprecated(
-    note = "runtime state schema versions belong to the state file; use RUNTIME_STATE_FILE_VERSION"
-)]
-pub const RUNTIME_STATE_VERSION: u32 = RUNTIME_STATE_FILE_VERSION;
-const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
-const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 1;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -132,13 +125,6 @@ impl RuntimeState {
 
         self.touch_at(finished_at_unix.max(unix_seconds_now()));
         Ok(())
-    }
-
-    #[deprecated(
-        note = "RuntimeState no longer owns the persisted file schema version; use RUNTIME_STATE_FILE_VERSION for the current file format"
-    )]
-    pub fn version(&self) -> u32 {
-        RUNTIME_STATE_FILE_VERSION
     }
 
     pub fn sessions(&self) -> &[Session] {
@@ -288,105 +274,29 @@ impl<'a> RuntimeStateFile<'a> {
 struct RuntimeStateFileWire {
     version: u32,
     sessions: Vec<Session>,
-    #[serde(default, deserialize_with = "deserialize_wire_field")]
-    runs: WireField<Vec<RunRecord>>,
-    #[serde(default, deserialize_with = "deserialize_wire_field")]
-    inbound_events: WireField<Vec<InboundEventRecord>>,
+    runs: Vec<RunRecord>,
+    inbound_events: Vec<InboundEventRecord>,
     updated_at_unix: u64,
 }
 
 impl RuntimeStateFileWire {
     fn into_state(self) -> Result<RuntimeState, String> {
-        let (runs, inbound_events) = match self.version {
-            RUNTIME_STATE_FILE_V1_VERSION => {
-                if self.runs.is_present() {
-                    return Err("runtime state version 1 must not contain run records".to_string());
-                }
+        if self.version != RUNTIME_STATE_FILE_VERSION {
+            return Err(format!(
+                "unsupported runtime state version {}; expected {}",
+                self.version, RUNTIME_STATE_FILE_VERSION
+            ));
+        }
 
-                if self.inbound_events.is_present() {
-                    return Err(
-                        "runtime state version 1 must not contain inbound event records"
-                            .to_string(),
-                    );
-                }
-
-                (Vec::new(), Vec::new())
-            }
-            RUNTIME_STATE_FILE_V2_VERSION => {
-                let runs = self
-                    .runs
-                    .into_required("runtime state version 2 must contain run records")?;
-
-                if self.inbound_events.is_present() {
-                    return Err(
-                        "runtime state version 2 must not contain inbound event records"
-                            .to_string(),
-                    );
-                }
-
-                (runs, Vec::new())
-            }
-            RUNTIME_STATE_FILE_VERSION => {
-                let runs = self.runs.into_required(format!(
-                    "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain run records"
-                ))?;
-                let inbound_events = self.inbound_events.into_required(format!(
-                    "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain inbound event records"
-                ))?;
-
-                (runs, inbound_events)
-            }
-            version => {
-                return Err(format!(
-                    "unsupported runtime state version {}; expected {}",
-                    version, RUNTIME_STATE_FILE_VERSION
-                ));
-            }
-        };
         let state = RuntimeState {
             sessions: self.sessions,
-            runs,
-            inbound_events,
+            runs: self.runs,
+            inbound_events: self.inbound_events,
             updated_at_unix: self.updated_at_unix,
         };
         state.validate()?;
         Ok(state)
     }
-}
-
-#[derive(Default)]
-enum WireField<T> {
-    #[default]
-    Missing,
-    Null,
-    Value(T),
-}
-
-impl<T> WireField<T> {
-    fn is_present(&self) -> bool {
-        !matches!(self, Self::Missing)
-    }
-
-    fn into_required<M>(self, message: M) -> Result<T, String>
-    where
-        M: fmt::Display,
-    {
-        match self {
-            Self::Value(value) => Ok(value),
-            Self::Missing | Self::Null => Err(message.to_string()),
-        }
-    }
-}
-
-fn deserialize_wire_field<'de, D, T>(deserializer: D) -> Result<WireField<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(match Option::<T>::deserialize(deserializer)? {
-        Some(value) => WireField::Value(value),
-        None => WireField::Null,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -684,7 +594,7 @@ mod tests {
     fn runtime_state_json_rejects_file_version_field() {
         let err = serde_json::from_str::<RuntimeState>(
             r#"{
-                "version": 2,
+                "version": 1,
                 "sessions": [],
                 "runs": [],
                 "inbound_events": [],
@@ -893,158 +803,15 @@ mod tests {
     }
 
     #[test]
-    fn state_load_migrates_version_1_without_runs_field() {
-        let path = test_path("state-v1-without-runs-field").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-                "version": 1,
-                "sessions": [],
-                "updated_at_unix": 1
-            }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let state = store
-            .load()
-            .expect("version 1 state without runs should migrate");
-
-        assert!(state.runs().is_empty());
-        assert!(state.inbound_events().is_empty());
-    }
-
-    #[test]
-    fn state_load_rejects_version_1_with_run_records() {
-        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
-        let session = Session::new(scope);
-        let session_id = session.id().clone();
-        let run = RunRecord::new(RunId::new("run_1").expect("valid run id"), session_id, 10);
-        let path = test_path("state-v1-with-runs").join("runtime.state.json");
-        let encoded = format!(
-            r#"{{
-                "version": 1,
-                "sessions": [{session}],
-                "runs": [{run}],
-                "updated_at_unix": 1
-            }}"#,
-            session = serde_json::to_string(&session).expect("session should encode"),
-            run = serde_json::to_string(&run).expect("run should encode")
-        );
-        fs::write(&path, encoded).expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 1 state must not carry run records");
-
-        assert!(err.contains("version 1 must not contain run records"));
-    }
-
-    #[test]
-    fn state_load_rejects_version_1_with_null_run_records() {
-        let path = test_path("state-v1-with-null-runs").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-                "version": 1,
-                "sessions": [],
-                "runs": null,
-                "updated_at_unix": 1
-            }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 1 state must reject present null runs");
-
-        assert!(err.contains("version 1 must not contain run records"));
-    }
-
-    #[test]
-    fn state_load_rejects_version_1_with_inbound_event_records() {
-        let event = event_fixture("evt_1", 10);
-        let record = state_event_record(&event, 12).expect("inbound event record should build");
-        let record_json = serde_json::to_string(&record).expect("event record should encode");
-        let path = test_path("state-v1-with-inbound-events").join("runtime.state.json");
-        let encoded = format!(
-            r#"{{
-                "version": 1,
-                "sessions": [],
-                "inbound_events": [{record_json}],
-                "updated_at_unix": 1
-            }}"#
-        );
-        fs::write(&path, encoded).expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 1 state must not carry inbound events");
-
-        assert!(err.contains("version 1 must not contain inbound event records"));
-    }
-
-    #[test]
-    fn state_load_migrates_version_2_without_inbound_event_records() {
-        let path = test_path("state-v2-without-inbound-events").join("runtime.state.json");
+    fn state_load_rejects_future_file_version() {
+        let path = test_path("state-future-version").join("runtime.state.json");
         fs::write(
             &path,
             r#"{
                 "version": 2,
                 "sessions": [],
                 "runs": [],
-                "updated_at_unix": 1
-            }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let state = store
-            .load()
-            .expect("version 2 state without inbound events should migrate");
-
-        assert!(state.runs().is_empty());
-        assert!(state.inbound_events().is_empty());
-    }
-
-    #[test]
-    fn state_load_rejects_version_2_with_inbound_event_records() {
-        let event = event_fixture("evt_1", 10);
-        let record = state_event_record(&event, 12).expect("inbound event record should build");
-        let record_json = serde_json::to_string(&record).expect("event record should encode");
-        let path = test_path("state-v2-with-inbound-events").join("runtime.state.json");
-        let encoded = format!(
-            r#"{{
-                "version": 2,
-                "sessions": [],
-                "runs": [],
-                "inbound_events": [{record_json}],
-                "updated_at_unix": 1
-            }}"#
-        );
-        fs::write(&path, encoded).expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 2 state must not carry inbound events");
-
-        assert!(err.contains("version 2 must not contain inbound event records"));
-    }
-
-    #[test]
-    fn state_load_rejects_version_2_with_null_inbound_event_records() {
-        let path = test_path("state-v2-with-null-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-                "version": 2,
-                "sessions": [],
-                "runs": [],
-                "inbound_events": null,
+                "inbound_events": [],
                 "updated_at_unix": 1
             }"#,
         )
@@ -1053,14 +820,14 @@ mod tests {
 
         let err = store
             .load()
-            .expect_err("version 2 state must reject present null inbound events");
+            .expect_err("future state versions must not be loaded");
 
-        assert!(err.contains("version 2 must not contain inbound event records"));
+        assert!(err.contains("unsupported runtime state version 2; expected 1"));
     }
 
     #[test]
     fn state_load_rejects_current_version_without_run_records() {
-        let path = test_path("state-v3-without-runs").join("runtime.state.json");
+        let path = test_path("state-v1-without-runs").join("runtime.state.json");
         fs::write(
             &path,
             format!(
@@ -1079,12 +846,12 @@ mod tests {
             .load()
             .expect_err("current state version must carry run records");
 
-        assert!(err.contains("must contain run records"));
+        assert!(err.contains("missing field `runs`"));
     }
 
     #[test]
     fn state_load_rejects_current_version_without_inbound_event_records() {
-        let path = test_path("state-v3-without-inbound-events").join("runtime.state.json");
+        let path = test_path("state-v1-without-inbound-events").join("runtime.state.json");
         fs::write(
             &path,
             format!(
@@ -1104,12 +871,12 @@ mod tests {
             .load()
             .expect_err("current state version must carry inbound events");
 
-        assert!(err.contains("must contain inbound event records"));
+        assert!(err.contains("missing field `inbound_events`"));
     }
 
     #[test]
     fn state_load_rejects_current_version_with_null_inbound_event_records() {
-        let path = test_path("state-v3-with-null-inbound-events").join("runtime.state.json");
+        let path = test_path("state-v1-with-null-inbound-events").join("runtime.state.json");
         fs::write(
             &path,
             format!(
@@ -1130,7 +897,7 @@ mod tests {
             .load()
             .expect_err("current state version must reject null inbound events");
 
-        assert!(err.contains("must contain inbound event records"));
+        assert!(err.contains("invalid type: null"));
     }
 
     #[test]
@@ -1174,6 +941,8 @@ mod tests {
                     "updated_at_unix": 1,
                     "future_field": true
                 }],
+                "runs": [],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }"#,
         )
@@ -1204,6 +973,8 @@ mod tests {
                     "created_at_unix": 1,
                     "updated_at_unix": 1
                 }],
+                "runs": [],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }"#,
         )
@@ -1372,6 +1143,8 @@ mod tests {
             r#"{{
                 "version": 1,
                 "sessions": [{session}, {session}],
+                "runs": [],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }}"#,
             session = serde_json::to_string(&session).expect("session should encode")
@@ -1481,6 +1254,8 @@ mod tests {
                     "created_at_unix": 1,
                     "updated_at_unix": 1
                 }],
+                "runs": [],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }"#,
         )
@@ -1507,6 +1282,8 @@ mod tests {
                     "created_at_unix": 100,
                     "updated_at_unix": 1
                 }],
+                "runs": [],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }"#,
         )
