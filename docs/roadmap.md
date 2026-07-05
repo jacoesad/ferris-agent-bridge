@@ -72,7 +72,7 @@ Status: complete, released as `v0.1.0`.
 
 Design note: [0.2 Runtime Foundations Design](design/0.2-runtime-foundations.md).
 
-Status: complete, included in version `0.2.0`.
+Status: version `0.2.0` shipped the foundation; post-`0.2.0` M2 hardening continues on `main` before the next release.
 
 - Versioned local config and profile loading (#4)
 - `SecretInput` placeholder for future keystore-backed secret sources (#4)
@@ -83,13 +83,13 @@ Status: complete, included in version `0.2.0`.
 - Structured log events with session and event context (#4)
 - Secret-value redaction for structured fields and inline values (#4)
 - Runtime error classification into fatal, recoverable, and user-visible classes (#4)
+- Run records and local state transitions: pending, running, completed, failed, and cancelled (#8)
 - Focused tests for config/state/session/message/event/logging/error behavior (#4)
 
 ## Milestone 3: Runtime Orchestrator
 
 Goal: layer durable orchestration on top of the runtime foundations without adding real IM or agent implementations yet.
 
-- Run records and state transitions: pending, running, completed, failed, and cancelled
 - Durable inbound event ledger for duplicate delivery handling
 - Ack-after-persist contract for inbound events
 - Durable outbound outbox for reliable reply delivery

@@ -289,6 +289,7 @@ impl<'de> Deserialize<'de> for RunRecord {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RunRecordWire {
             id: RunId,
             session_id: SessionId,

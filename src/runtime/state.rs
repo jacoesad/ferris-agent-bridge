@@ -15,14 +15,17 @@ use super::{
     session::{Session, SessionId},
 };
 
-pub const RUNTIME_STATE_VERSION: u32 = 2;
-const RUNTIME_STATE_V1_VERSION: u32 = 1;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 2;
+#[deprecated(
+    note = "runtime state schema versions belong to the state file; use RUNTIME_STATE_FILE_VERSION"
+)]
+pub const RUNTIME_STATE_VERSION: u32 = RUNTIME_STATE_FILE_VERSION;
+const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeState {
-    version: u32,
     sessions: Vec<Session>,
     runs: Vec<RunRecord>,
     updated_at_unix: u64,
@@ -31,7 +34,6 @@ pub struct RuntimeState {
 impl RuntimeState {
     pub fn new() -> Self {
         Self {
-            version: RUNTIME_STATE_VERSION,
             sessions: Vec::new(),
             runs: Vec::new(),
             updated_at_unix: unix_seconds_now(),
@@ -112,8 +114,11 @@ impl RuntimeState {
         Ok(())
     }
 
+    #[deprecated(
+        note = "RuntimeState no longer owns the persisted file schema version; use RUNTIME_STATE_FILE_VERSION for the current file format"
+    )]
     pub fn version(&self) -> u32 {
-        self.version
+        RUNTIME_STATE_FILE_VERSION
     }
 
     pub fn sessions(&self) -> &[Session] {
@@ -129,13 +134,6 @@ impl RuntimeState {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != RUNTIME_STATE_VERSION {
-            return Err(format!(
-                "unsupported runtime state version {}; expected {}",
-                self.version, RUNTIME_STATE_VERSION
-            ));
-        }
-
         let mut session_ids = BTreeSet::new();
         let mut run_ids = BTreeSet::new();
 
@@ -195,43 +193,80 @@ impl<'de> Deserialize<'de> for RuntimeState {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RuntimeStateWire {
-            version: u32,
             sessions: Vec<Session>,
-            runs: Option<Vec<RunRecord>>,
+            runs: Vec<RunRecord>,
             updated_at_unix: u64,
         }
 
         let wire = RuntimeStateWire::deserialize(deserializer)?;
-        let runs = match wire.version {
-            RUNTIME_STATE_V1_VERSION => {
-                if wire.runs.is_some() {
-                    return Err(de::Error::custom(
-                        "runtime state version 1 must not contain run records",
-                    ));
+        let state = Self {
+            sessions: wire.sessions,
+            runs: wire.runs,
+            updated_at_unix: wire.updated_at_unix,
+        };
+        state.validate().map_err(de::Error::custom)?;
+        Ok(state)
+    }
+}
+
+#[derive(Serialize)]
+struct RuntimeStateFile<'a> {
+    version: u32,
+    sessions: &'a [Session],
+    runs: &'a [RunRecord],
+    updated_at_unix: u64,
+}
+
+impl<'a> RuntimeStateFile<'a> {
+    fn from_state(state: &'a RuntimeState) -> Self {
+        Self {
+            version: RUNTIME_STATE_FILE_VERSION,
+            sessions: &state.sessions,
+            runs: &state.runs,
+            updated_at_unix: state.updated_at_unix,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeStateFileWire {
+    version: u32,
+    sessions: Vec<Session>,
+    runs: Option<Vec<RunRecord>>,
+    updated_at_unix: u64,
+}
+
+impl RuntimeStateFileWire {
+    fn into_state(self) -> Result<RuntimeState, String> {
+        let runs = match self.version {
+            RUNTIME_STATE_FILE_V1_VERSION => {
+                if self.runs.is_some() {
+                    return Err("runtime state version 1 must not contain run records".to_string());
                 }
 
                 Vec::new()
             }
-            RUNTIME_STATE_VERSION => wire.runs.ok_or_else(|| {
-                de::Error::custom(format!(
-                    "runtime state version {RUNTIME_STATE_VERSION} must contain run records"
-                ))
+            RUNTIME_STATE_FILE_VERSION => self.runs.ok_or_else(|| {
+                format!(
+                    "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain run records"
+                )
             })?,
             version => {
-                return Err(de::Error::custom(format!(
+                return Err(format!(
                     "unsupported runtime state version {}; expected {}",
-                    version, RUNTIME_STATE_VERSION
-                )));
+                    version, RUNTIME_STATE_FILE_VERSION
+                ));
             }
         };
-        let state = Self {
-            version: RUNTIME_STATE_VERSION,
-            sessions: wire.sessions,
+        let state = RuntimeState {
+            sessions: self.sessions,
             runs,
-            updated_at_unix: wire.updated_at_unix,
+            updated_at_unix: self.updated_at_unix,
         };
-        state.validate().map_err(de::Error::custom)?;
+        state.validate()?;
         Ok(state)
     }
 }
@@ -264,15 +299,17 @@ impl StateStore {
             }
         };
 
-        let state: RuntimeState = serde_json::from_str(&input)
+        let state_file: RuntimeStateFileWire = serde_json::from_str(&input)
             .map_err(|err| format!("failed to parse {}: {err}", self.path.display()))?;
-        state.validate()?;
-        Ok(state)
+        state_file
+            .into_state()
+            .map_err(|err| format!("failed to parse {}: {err}", self.path.display()))
     }
 
     pub fn save(&self, state: &RuntimeState) -> Result<(), String> {
         state.validate()?;
-        write_json_atomic(&self.path, state).map_err(|err| {
+        let state_file = RuntimeStateFile::from_state(state);
+        write_json_atomic(&self.path, &state_file).map_err(|err| {
             format!(
                 "failed to save runtime state {}: {err}",
                 self.path.display()
@@ -511,6 +548,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_state_json_does_not_embed_file_version() {
+        let encoded = serde_json::to_value(RuntimeState::new()).expect("state should encode");
+
+        assert!(encoded.get("version").is_none());
+        assert!(encoded.get("sessions").is_some());
+        assert!(encoded.get("runs").is_some());
+        assert!(encoded.get("updated_at_unix").is_some());
+    }
+
+    #[test]
+    fn runtime_state_json_rejects_file_version_field() {
+        let err = serde_json::from_str::<RuntimeState>(
+            r#"{
+                "version": 2,
+                "sessions": [],
+                "runs": [],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect_err("RuntimeState should not accept file envelope fields");
+
+        assert!(err.to_string().contains("unknown field `version`"));
+    }
+
+    #[test]
+    fn state_store_writes_file_version_envelope() {
+        let path = test_path("state-file-version-envelope").join("runtime.state.json");
+        let store = StateStore::new(&path);
+
+        store.save(&RuntimeState::new()).expect("state should save");
+
+        let encoded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("state file should read"))
+                .expect("state file should decode");
+
+        assert_eq!(
+            encoded.get("version").and_then(serde_json::Value::as_u64),
+            Some(u64::from(super::RUNTIME_STATE_FILE_VERSION))
+        );
+        assert!(encoded.get("sessions").is_some());
+        assert!(encoded.get("runs").is_some());
+        assert!(encoded.get("updated_at_unix").is_some());
+    }
+
+    #[test]
     fn state_transitions_persisted_run_records() {
         let (mut state, run_id) = state_with_pending_run("run_1");
 
@@ -651,7 +733,6 @@ mod tests {
             .load()
             .expect("version 1 state without runs should migrate");
 
-        assert_eq!(state.version(), super::RUNTIME_STATE_VERSION);
         assert!(state.runs().is_empty());
     }
 
@@ -693,7 +774,7 @@ mod tests {
                     "sessions": [],
                     "updated_at_unix": 1
                 }}"#,
-                super::RUNTIME_STATE_VERSION
+                super::RUNTIME_STATE_FILE_VERSION
             ),
         )
         .expect("state fixture should write");
@@ -704,6 +785,126 @@ mod tests {
             .expect_err("current state version must carry run records");
 
         assert!(err.contains("must contain run records"));
+    }
+
+    #[test]
+    fn state_load_rejects_unknown_file_fields() {
+        let path = test_path("state-unknown-file-fields").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                    "version": {},
+                    "sessions": [],
+                    "runs": [],
+                    "future_field": [],
+                    "updated_at_unix": 1
+                }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown state file fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+
+    #[test]
+    fn state_load_rejects_unknown_session_fields() {
+        let path = test_path("state-unknown-session-fields").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "sessions": [{
+                    "id": "session_v1_4_6c61726b_b_636861743a6f635f313233",
+                    "scope": {"platform": "lark", "scope": "chat:oc_123"},
+                    "created_at_unix": 1,
+                    "updated_at_unix": 1,
+                    "future_field": true
+                }],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown session fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+
+    #[test]
+    fn state_load_rejects_unknown_session_scope_fields() {
+        let path = test_path("state-unknown-session-scope-fields").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "sessions": [{
+                    "id": "session_v1_4_6c61726b_b_636861743a6f635f313233",
+                    "scope": {
+                        "platform": "lark",
+                        "scope": "chat:oc_123",
+                        "future_field": true
+                    },
+                    "created_at_unix": 1,
+                    "updated_at_unix": 1
+                }],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown session scope fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+
+    #[test]
+    fn state_load_rejects_unknown_run_fields() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let run = RunRecord::new(RunId::new("run_1").expect("valid run id"), session_id, 10);
+        let path = test_path("state-unknown-run-fields").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": {version},
+                "sessions": [{session}],
+                "runs": [{{
+                    "id": "run_1",
+                    "session_id": "{session_id}",
+                    "status": "pending",
+                    "created_at_unix": 10,
+                    "updated_at_unix": 10,
+                    "started_at_unix": null,
+                    "finished_at_unix": null,
+                    "future_field": true
+                }}],
+                "updated_at_unix": 1
+            }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            session_id = run.session_id()
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown run fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
     }
 
     #[test]
@@ -823,7 +1024,7 @@ mod tests {
                 "runs": [{run}, {run}],
                 "updated_at_unix": 1
             }}"#,
-            version = super::RUNTIME_STATE_VERSION,
+            version = super::RUNTIME_STATE_FILE_VERSION,
             session = serde_json::to_string(&session).expect("session should encode"),
             run = serde_json::to_string(&run).expect("run should encode")
         );
@@ -850,7 +1051,7 @@ mod tests {
                 "runs": [{run}],
                 "updated_at_unix": 1
             }}"#,
-            version = super::RUNTIME_STATE_VERSION,
+            version = super::RUNTIME_STATE_FILE_VERSION,
             run = serde_json::to_string(&run).expect("run should encode")
         );
         fs::write(&path, encoded).expect("state fixture should write");
