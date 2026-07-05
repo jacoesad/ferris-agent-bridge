@@ -72,7 +72,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 
 设计说明：[0.2 Runtime Foundations 设计](design/0.2-runtime-foundations.zh.md)。
 
-状态：已完成，并包含在版本 `0.2.0` 中。
+状态：版本 `0.2.0` 已发布 foundation；`0.2.0` 之后的 M2 hardening 继续在 `main` 上完成，并随下一个版本发布。
 
 - Versioned local config 和 profile loading（#4）
 - 面向未来 keystore-backed secret sources 的 `SecretInput` 占位（#4）
@@ -83,13 +83,13 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - 带 session 和 event context 的 structured log events（#4）
 - Structured fields 和 inline values 的 secret-value redaction（#4）
 - Runtime errors 分为 fatal、recoverable 和 user-visible classes（#4）
+- Run records 和本地状态转换：pending、running、completed、failed、cancelled（#8）
 - 覆盖 config/state/session/message/event/logging/error 行为的聚焦测试（#4）
 
 ## Milestone 3: Runtime Orchestrator
 
 目标：在 runtime foundations 之上加入 durable orchestration，但暂不加入真实 IM 或 agent 实现。
 
-- Run records 和状态转换：pending、running、completed、failed、cancelled
 - 用于重复投递处理的 durable inbound event ledger
 - Inbound events 的 ack-after-persist contract
 - 用于可靠回复投递的 durable outbound outbox

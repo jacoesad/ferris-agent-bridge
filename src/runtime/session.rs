@@ -91,6 +91,7 @@ impl<'de> Deserialize<'de> for SessionScope {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct SessionScopeWire {
             platform: String,
             scope: String,
@@ -180,6 +181,7 @@ impl<'de> Deserialize<'de> for Session {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct SessionWire {
             id: SessionId,
             scope: SessionScope,
