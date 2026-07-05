@@ -9,7 +9,9 @@ pub mod state;
 
 pub use config::{BridgeConfig, RuntimeConfig, SecretInput};
 pub use error::{ErrorClass, RuntimeError};
-pub use event::{Event, EventId, EventKind, EventSource};
+pub use event::{
+    Event, EventId, EventKind, EventSource, InboundEventRecord, InboundEventRecordStatus,
+};
 pub use logging::{LogContext, LogLevel, Redactor, StructuredLogEvent};
 pub use message::{Message, MessageAuthor, MessageContent, MessageId};
 pub use run::{RunId, RunRecord, RunStatus};
