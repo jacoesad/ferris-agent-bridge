@@ -61,6 +61,8 @@ Core Runtime
 
 事件投递应建模为领域层 transport 能力，而不是固定协议选择。transport trait 应描述 adapter 对交互通道的需求：连接生命周期、输入 raw events、必要时的 delivery acknowledgement、连接状态和 shutdown。WebSocket、webhook、long polling、gateway connections 和官方 channel SDK 都只是这个 transport 边界的具体实现。
 
+当某个 transport 支持显式 delivery acknowledgement 时，adapter 应先请求 runtime 持久化或去重归一化后的 inbound event，然后再 ack 平台 delivery。Foundation layer 只提供 persistence primitive；显式 transport ack 调用应随 `ImAdapter` 和 runtime orchestrator 边界一起引入。如果持久化失败，本次 delivery 必须保持未 ack，让平台按照自身 transport 语义重试。
+
 ### Core 与平台模块
 
 Core runtime 模块应定义平台无关的领域模型和行为：
