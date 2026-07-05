@@ -91,7 +91,8 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 目标：在 runtime foundations 之上加入 durable orchestration，但暂不加入真实 IM 或 agent 实现。
 
 - 用于重复投递处理的 durable inbound event ledger（#9）
-- Inbound events 的 ack-after-persist contract
+- Inbound events 的 store-level ack-after-persist persistence primitive
+- 通过 `ImAdapter` 和 runtime orchestrator 边界接入显式 transport acknowledgement
 - 用于可靠回复投递的 durable outbound outbox
 - Per-scope message queue，包含 debounce 和 batching
 - Scope 级互斥：同一个 scope 同时最多一个 active run

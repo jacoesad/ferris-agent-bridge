@@ -61,6 +61,8 @@ Each IM adapter can choose its own internal structure. For example, a Slack adap
 
 Event delivery should be modeled as a domain-level transport capability, not as a fixed protocol choice. A transport trait should describe what the adapter needs from the interaction channel: connection lifecycle, incoming raw events, delivery acknowledgements when required, connection status, and shutdown. WebSocket, webhook, long polling, gateway connections, and official channel SDKs are concrete implementations of that transport boundary.
 
+When a transport supports explicit delivery acknowledgement, the adapter should ask the runtime to persist or de-duplicate the normalized inbound event before acknowledging the platform delivery. The foundation layer only provides the persistence primitive; the explicit transport ack call should be introduced with the `ImAdapter` and runtime orchestrator boundaries. A failed persistence attempt must leave the delivery unacknowledged so the platform can retry according to its own transport semantics.
+
 ### Core and Platform Modules
 
 Core runtime modules should define platform-neutral domain models and behavior:
