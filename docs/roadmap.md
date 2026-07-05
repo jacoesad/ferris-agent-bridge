@@ -90,7 +90,7 @@ Status: version `0.2.0` shipped the foundation; post-`0.2.0` M2 hardening contin
 
 Goal: layer durable orchestration on top of the runtime foundations without adding real IM or agent implementations yet.
 
-- Durable inbound event ledger for duplicate delivery handling
+- Durable inbound event ledger for duplicate delivery handling (#9)
 - Ack-after-persist contract for inbound events
 - Durable outbound outbox for reliable reply delivery
 - Per-scope message queue with debounce and batching
