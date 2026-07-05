@@ -38,6 +38,79 @@ impl<'de> Deserialize<'de> for EventId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboundEventRecord {
+    id: EventId,
+    received_at_unix: u64,
+    recorded_at_unix: u64,
+}
+
+impl InboundEventRecord {
+    pub fn new(id: EventId, received_at_unix: u64, recorded_at_unix: u64) -> Result<Self, String> {
+        let record = Self {
+            id,
+            received_at_unix,
+            recorded_at_unix,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn from_event(event: &Event, recorded_at_unix: u64) -> Result<Self, String> {
+        Self::new(
+            event.id.clone(),
+            event.received_at_unix,
+            recorded_at_unix.max(event.received_at_unix),
+        )
+    }
+
+    pub fn id(&self) -> &EventId {
+        &self.id
+    }
+
+    pub fn received_at_unix(&self) -> u64 {
+        self.received_at_unix
+    }
+
+    pub fn recorded_at_unix(&self) -> u64 {
+        self.recorded_at_unix
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.recorded_at_unix < self.received_at_unix {
+            return Err(format!(
+                "inbound event {} has recorded_at_unix before received_at_unix",
+                self.id
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for InboundEventRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct InboundEventRecordWire {
+            id: EventId,
+            received_at_unix: u64,
+            recorded_at_unix: u64,
+        }
+
+        let wire = InboundEventRecordWire::deserialize(deserializer)?;
+        Self::new(wire.id, wire.received_at_unix, wire.recorded_at_unix).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundEventRecordStatus {
+    Recorded,
+    Duplicate,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventSource {
@@ -75,7 +148,7 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
-    use super::{Event, EventId, EventKind, EventSource};
+    use super::{Event, EventId, EventKind, EventSource, InboundEventRecord};
     use crate::runtime::message::Message;
 
     #[test]
@@ -100,5 +173,56 @@ mod tests {
             serde_json::from_str::<EventId>("\"\"").expect_err("empty event id json should fail");
 
         assert!(err.to_string().contains("event id must not be empty"));
+    }
+
+    #[test]
+    fn inbound_event_record_round_trips_as_json() {
+        let event = event_fixture("evt_1", 10);
+        let record = InboundEventRecord::from_event(&event, 12).expect("record should be valid");
+
+        let encoded = serde_json::to_string(&record).expect("record should serialize");
+        let decoded: InboundEventRecord =
+            serde_json::from_str(&encoded).expect("record should decode");
+
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.id().as_str(), "evt_1");
+        assert_eq!(decoded.received_at_unix(), 10);
+        assert_eq!(decoded.recorded_at_unix(), 12);
+    }
+
+    #[test]
+    fn inbound_event_record_does_not_record_before_received_at() {
+        let event = event_fixture("evt_1", 10);
+        let record = InboundEventRecord::from_event(&event, 8)
+            .expect("recorded time should be clamped to event receive time");
+
+        assert_eq!(record.recorded_at_unix(), 10);
+    }
+
+    #[test]
+    fn rejects_invalid_inbound_event_record_time_order_from_json() {
+        let err = serde_json::from_str::<InboundEventRecord>(
+            r#"{
+                "id": "evt_1",
+                "received_at_unix": 10,
+                "recorded_at_unix": 9
+            }"#,
+        )
+        .expect_err("recorded before received should fail");
+
+        assert!(
+            err.to_string()
+                .contains("recorded_at_unix before received_at_unix")
+        );
+    }
+
+    fn event_fixture(id: &str, received_at_unix: u64) -> Event {
+        let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
+        Event::new(
+            EventId::new(id).expect("valid id"),
+            EventSource::Platform,
+            EventKind::MessageReceived { message },
+            received_at_unix,
+        )
     }
 }

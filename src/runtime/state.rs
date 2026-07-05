@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -11,16 +12,18 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, de, de::DeserializeOwned};
 
 use super::{
+    event::{Event, EventId, InboundEventRecord, InboundEventRecordStatus},
     run::{RunId, RunRecord},
     session::{Session, SessionId},
 };
 
-pub const RUNTIME_STATE_FILE_VERSION: u32 = 2;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 3;
 #[deprecated(
     note = "runtime state schema versions belong to the state file; use RUNTIME_STATE_FILE_VERSION"
 )]
 pub const RUNTIME_STATE_VERSION: u32 = RUNTIME_STATE_FILE_VERSION;
 const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
+const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -28,6 +31,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 pub struct RuntimeState {
     sessions: Vec<Session>,
     runs: Vec<RunRecord>,
+    inbound_events: Vec<InboundEventRecord>,
     updated_at_unix: u64,
 }
 
@@ -36,6 +40,7 @@ impl RuntimeState {
         Self {
             sessions: Vec::new(),
             runs: Vec::new(),
+            inbound_events: Vec::new(),
             updated_at_unix: unix_seconds_now(),
         }
     }
@@ -72,6 +77,21 @@ impl RuntimeState {
 
     pub fn run(&self, id: &RunId) -> Option<&RunRecord> {
         self.runs.iter().find(|run| run.id() == id)
+    }
+
+    pub fn record_inbound_event(
+        &mut self,
+        event: &Event,
+    ) -> Result<InboundEventRecordStatus, String> {
+        self.record_inbound_event_at(event, unix_seconds_now())
+    }
+
+    pub fn inbound_event(&self, id: &EventId) -> Option<&InboundEventRecord> {
+        self.inbound_events.iter().find(|event| event.id() == id)
+    }
+
+    pub fn has_inbound_event(&self, id: &EventId) -> bool {
+        self.inbound_event(id).is_some()
     }
 
     pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {
@@ -129,6 +149,10 @@ impl RuntimeState {
         &self.runs
     }
 
+    pub fn inbound_events(&self) -> &[InboundEventRecord] {
+        &self.inbound_events
+    }
+
     pub fn updated_at_unix(&self) -> u64 {
         self.updated_at_unix
     }
@@ -136,6 +160,7 @@ impl RuntimeState {
     pub fn validate(&self) -> Result<(), String> {
         let mut session_ids = BTreeSet::new();
         let mut run_ids = BTreeSet::new();
+        let mut inbound_event_ids = BTreeSet::new();
 
         for session in &self.sessions {
             session.validate()?;
@@ -151,6 +176,14 @@ impl RuntimeState {
 
             if !run_ids.insert(run.id()) {
                 return Err(format!("duplicate run id {}", run.id()));
+            }
+        }
+
+        for event in &self.inbound_events {
+            event.validate()?;
+
+            if !inbound_event_ids.insert(event.id()) {
+                return Err(format!("duplicate inbound event id {}", event.id()));
             }
         }
 
@@ -176,6 +209,22 @@ impl RuntimeState {
             .ok_or_else(|| format!("unknown run id {id}"))
     }
 
+    fn record_inbound_event_at(
+        &mut self,
+        event: &Event,
+        recorded_at_unix: u64,
+    ) -> Result<InboundEventRecordStatus, String> {
+        if self.has_inbound_event(&event.id) {
+            return Ok(InboundEventRecordStatus::Duplicate);
+        }
+
+        let record = InboundEventRecord::from_event(event, recorded_at_unix)?;
+        let recorded_at_unix = record.recorded_at_unix();
+        self.inbound_events.push(record);
+        self.touch_at(recorded_at_unix);
+        Ok(InboundEventRecordStatus::Recorded)
+    }
+
     fn touch_at(&mut self, updated_at_unix: u64) {
         self.updated_at_unix = self.updated_at_unix.max(updated_at_unix);
     }
@@ -197,6 +246,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
         struct RuntimeStateWire {
             sessions: Vec<Session>,
             runs: Vec<RunRecord>,
+            inbound_events: Vec<InboundEventRecord>,
             updated_at_unix: u64,
         }
 
@@ -204,6 +254,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
         let state = Self {
             sessions: wire.sessions,
             runs: wire.runs,
+            inbound_events: wire.inbound_events,
             updated_at_unix: wire.updated_at_unix,
         };
         state.validate().map_err(de::Error::custom)?;
@@ -216,6 +267,7 @@ struct RuntimeStateFile<'a> {
     version: u32,
     sessions: &'a [Session],
     runs: &'a [RunRecord],
+    inbound_events: &'a [InboundEventRecord],
     updated_at_unix: u64,
 }
 
@@ -225,6 +277,7 @@ impl<'a> RuntimeStateFile<'a> {
             version: RUNTIME_STATE_FILE_VERSION,
             sessions: &state.sessions,
             runs: &state.runs,
+            inbound_events: &state.inbound_events,
             updated_at_unix: state.updated_at_unix,
         }
     }
@@ -235,25 +288,54 @@ impl<'a> RuntimeStateFile<'a> {
 struct RuntimeStateFileWire {
     version: u32,
     sessions: Vec<Session>,
-    runs: Option<Vec<RunRecord>>,
+    #[serde(default, deserialize_with = "deserialize_wire_field")]
+    runs: WireField<Vec<RunRecord>>,
+    #[serde(default, deserialize_with = "deserialize_wire_field")]
+    inbound_events: WireField<Vec<InboundEventRecord>>,
     updated_at_unix: u64,
 }
 
 impl RuntimeStateFileWire {
     fn into_state(self) -> Result<RuntimeState, String> {
-        let runs = match self.version {
+        let (runs, inbound_events) = match self.version {
             RUNTIME_STATE_FILE_V1_VERSION => {
-                if self.runs.is_some() {
+                if self.runs.is_present() {
                     return Err("runtime state version 1 must not contain run records".to_string());
                 }
 
-                Vec::new()
+                if self.inbound_events.is_present() {
+                    return Err(
+                        "runtime state version 1 must not contain inbound event records"
+                            .to_string(),
+                    );
+                }
+
+                (Vec::new(), Vec::new())
             }
-            RUNTIME_STATE_FILE_VERSION => self.runs.ok_or_else(|| {
-                format!(
+            RUNTIME_STATE_FILE_V2_VERSION => {
+                let runs = self
+                    .runs
+                    .into_required("runtime state version 2 must contain run records")?;
+
+                if self.inbound_events.is_present() {
+                    return Err(
+                        "runtime state version 2 must not contain inbound event records"
+                            .to_string(),
+                    );
+                }
+
+                (runs, Vec::new())
+            }
+            RUNTIME_STATE_FILE_VERSION => {
+                let runs = self.runs.into_required(format!(
                     "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain run records"
-                )
-            })?,
+                ))?;
+                let inbound_events = self.inbound_events.into_required(format!(
+                    "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain inbound event records"
+                ))?;
+
+                (runs, inbound_events)
+            }
             version => {
                 return Err(format!(
                     "unsupported runtime state version {}; expected {}",
@@ -264,11 +346,47 @@ impl RuntimeStateFileWire {
         let state = RuntimeState {
             sessions: self.sessions,
             runs,
+            inbound_events,
             updated_at_unix: self.updated_at_unix,
         };
         state.validate()?;
         Ok(state)
     }
+}
+
+#[derive(Default)]
+enum WireField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> WireField<T> {
+    fn is_present(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+
+    fn into_required<M>(self, message: M) -> Result<T, String>
+    where
+        M: fmt::Display,
+    {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::Missing | Self::Null => Err(message.to_string()),
+        }
+    }
+}
+
+fn deserialize_wire_field<'de, D, T>(deserializer: D) -> Result<WireField<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(match Option::<T>::deserialize(deserializer)? {
+        Some(value) => WireField::Value(value),
+        None => WireField::Null,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +614,10 @@ mod tests {
 
     use super::{RuntimeState, StateStore, non_empty_parent, open_private_new_file};
     use crate::runtime::{
+        event::{
+            Event, EventId, EventKind, EventSource, InboundEventRecord, InboundEventRecordStatus,
+        },
+        message::Message,
         run::{RunId, RunRecord, RunStatus},
         session::{Session, SessionScope},
     };
@@ -554,6 +676,7 @@ mod tests {
         assert!(encoded.get("version").is_none());
         assert!(encoded.get("sessions").is_some());
         assert!(encoded.get("runs").is_some());
+        assert!(encoded.get("inbound_events").is_some());
         assert!(encoded.get("updated_at_unix").is_some());
     }
 
@@ -564,6 +687,7 @@ mod tests {
                 "version": 2,
                 "sessions": [],
                 "runs": [],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }"#,
         )
@@ -590,6 +714,58 @@ mod tests {
         assert!(encoded.get("sessions").is_some());
         assert!(encoded.get("runs").is_some());
         assert!(encoded.get("updated_at_unix").is_some());
+        assert!(encoded.get("inbound_events").is_some());
+    }
+
+    #[test]
+    fn state_store_round_trips_inbound_event_ledger() {
+        let path = test_path("state-inbound-event-round-trip").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let event = event_fixture("evt_1", 10);
+        let mut state = RuntimeState::new();
+
+        assert_eq!(
+            state
+                .record_inbound_event_at(&event, 12)
+                .expect("event should record"),
+            InboundEventRecordStatus::Recorded
+        );
+
+        store.save(&state).expect("state should save");
+        let loaded = store.load().expect("state should load");
+
+        let record = loaded
+            .inbound_event(&event.id)
+            .expect("inbound event record should exist");
+        assert_eq!(record.received_at_unix(), 10);
+        assert_eq!(record.recorded_at_unix(), 12);
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn state_records_inbound_events_idempotently() {
+        let event = event_fixture("evt_1", 10);
+        let mut state = RuntimeState::new();
+        state.updated_at_unix = 20;
+
+        assert_eq!(
+            state
+                .record_inbound_event_at(&event, 12)
+                .expect("event should record"),
+            InboundEventRecordStatus::Recorded
+        );
+        assert!(state.has_inbound_event(&event.id));
+        assert_eq!(state.inbound_events().len(), 1);
+        assert_eq!(state.updated_at_unix(), 20);
+
+        assert_eq!(
+            state
+                .record_inbound_event_at(&event, 30)
+                .expect("duplicate event should not fail"),
+            InboundEventRecordStatus::Duplicate
+        );
+        assert_eq!(state.inbound_events().len(), 1);
+        assert_eq!(state.updated_at_unix(), 20);
     }
 
     #[test]
@@ -713,6 +889,7 @@ mod tests {
 
         assert!(state.sessions().is_empty());
         assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
     }
 
     #[test]
@@ -734,6 +911,7 @@ mod tests {
             .expect("version 1 state without runs should migrate");
 
         assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
     }
 
     #[test]
@@ -764,8 +942,125 @@ mod tests {
     }
 
     #[test]
+    fn state_load_rejects_version_1_with_null_run_records() {
+        let path = test_path("state-v1-with-null-runs").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "sessions": [],
+                "runs": null,
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 1 state must reject present null runs");
+
+        assert!(err.contains("version 1 must not contain run records"));
+    }
+
+    #[test]
+    fn state_load_rejects_version_1_with_inbound_event_records() {
+        let event = event_fixture("evt_1", 10);
+        let record = state_event_record(&event, 12).expect("inbound event record should build");
+        let record_json = serde_json::to_string(&record).expect("event record should encode");
+        let path = test_path("state-v1-with-inbound-events").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": 1,
+                "sessions": [],
+                "inbound_events": [{record_json}],
+                "updated_at_unix": 1
+            }}"#
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 1 state must not carry inbound events");
+
+        assert!(err.contains("version 1 must not contain inbound event records"));
+    }
+
+    #[test]
+    fn state_load_migrates_version_2_without_inbound_event_records() {
+        let path = test_path("state-v2-without-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "sessions": [],
+                "runs": [],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 2 state without inbound events should migrate");
+
+        assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+    }
+
+    #[test]
+    fn state_load_rejects_version_2_with_inbound_event_records() {
+        let event = event_fixture("evt_1", 10);
+        let record = state_event_record(&event, 12).expect("inbound event record should build");
+        let record_json = serde_json::to_string(&record).expect("event record should encode");
+        let path = test_path("state-v2-with-inbound-events").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": 2,
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [{record_json}],
+                "updated_at_unix": 1
+            }}"#
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 2 state must not carry inbound events");
+
+        assert!(err.contains("version 2 must not contain inbound event records"));
+    }
+
+    #[test]
+    fn state_load_rejects_version_2_with_null_inbound_event_records() {
+        let path = test_path("state-v2-with-null-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 2,
+                "sessions": [],
+                "runs": [],
+                "inbound_events": null,
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 2 state must reject present null inbound events");
+
+        assert!(err.contains("version 2 must not contain inbound event records"));
+    }
+
+    #[test]
     fn state_load_rejects_current_version_without_run_records() {
-        let path = test_path("state-v2-without-runs").join("runtime.state.json");
+        let path = test_path("state-v3-without-runs").join("runtime.state.json");
         fs::write(
             &path,
             format!(
@@ -788,6 +1083,57 @@ mod tests {
     }
 
     #[test]
+    fn state_load_rejects_current_version_without_inbound_event_records() {
+        let path = test_path("state-v3-without-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                    "version": {},
+                    "sessions": [],
+                    "runs": [],
+                    "updated_at_unix": 1
+                }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must carry inbound events");
+
+        assert!(err.contains("must contain inbound event records"));
+    }
+
+    #[test]
+    fn state_load_rejects_current_version_with_null_inbound_event_records() {
+        let path = test_path("state-v3-with-null-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                    "version": {},
+                    "sessions": [],
+                    "runs": [],
+                    "inbound_events": null,
+                    "updated_at_unix": 1
+                }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must reject null inbound events");
+
+        assert!(err.contains("must contain inbound event records"));
+    }
+
+    #[test]
     fn state_load_rejects_unknown_file_fields() {
         let path = test_path("state-unknown-file-fields").join("runtime.state.json");
         fs::write(
@@ -797,6 +1143,7 @@ mod tests {
                     "version": {},
                     "sessions": [],
                     "runs": [],
+                    "inbound_events": [],
                     "future_field": [],
                     "updated_at_unix": 1
                 }}"#,
@@ -891,6 +1238,7 @@ mod tests {
                     "finished_at_unix": null,
                     "future_field": true
                 }}],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -1022,6 +1370,7 @@ mod tests {
                 "version": {version},
                 "sessions": [{session}],
                 "runs": [{run}, {run}],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -1049,6 +1398,7 @@ mod tests {
                 "version": {version},
                 "sessions": [],
                 "runs": [{run}],
+                "inbound_events": [],
                 "updated_at_unix": 1
             }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -1062,6 +1412,32 @@ mod tests {
             .expect_err("run without known session should be rejected");
 
         assert!(err.contains("references unknown session"));
+    }
+
+    #[test]
+    fn state_validation_rejects_duplicate_inbound_event_ids() {
+        let event = event_fixture("evt_1", 10);
+        let record = state_event_record(&event, 12).expect("inbound event record should build");
+        let path = test_path("state-duplicate-inbound-event-ids").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": {version},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [{record}, {record}],
+                "updated_at_unix": 1
+            }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            record = serde_json::to_string(&record).expect("event record should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("duplicate inbound event ids should be rejected");
+
+        assert!(err.contains("duplicate inbound event id"));
     }
 
     #[test]
@@ -1148,6 +1524,23 @@ mod tests {
             scope.scope()
         ))
         .expect("session fixture should decode")
+    }
+
+    fn event_fixture(id: &str, received_at_unix: u64) -> Event {
+        let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
+        Event::new(
+            EventId::new(id).expect("valid event id"),
+            EventSource::Platform,
+            EventKind::MessageReceived { message },
+            received_at_unix,
+        )
+    }
+
+    fn state_event_record(
+        event: &Event,
+        recorded_at_unix: u64,
+    ) -> Result<InboundEventRecord, String> {
+        InboundEventRecord::from_event(event, recorded_at_unix)
     }
 
     fn state_with_pending_run(run_id: &str) -> (RuntimeState, RunId) {
