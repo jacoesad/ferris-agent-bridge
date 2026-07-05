@@ -3,6 +3,7 @@ pub mod error;
 pub mod event;
 pub mod logging;
 pub mod message;
+pub mod orchestrator;
 pub mod run;
 pub mod session;
 pub mod state;
@@ -14,6 +15,7 @@ pub use event::{
 };
 pub use logging::{LogContext, LogLevel, Redactor, StructuredLogEvent};
 pub use message::{Message, MessageAuthor, MessageContent, MessageId};
+pub use orchestrator::{InboundDeliveryOutcome, RuntimeOrchestrator};
 pub use run::{RunId, RunRecord, RunStatus};
 pub use session::{Session, SessionId, SessionScope};
 pub use state::{RuntimeState, StateStore};

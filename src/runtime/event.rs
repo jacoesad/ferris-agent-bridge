@@ -8,6 +8,12 @@ use super::{message::Message, session::SessionId};
 pub struct EventId(String);
 
 impl EventId {
+    /// Creates an event id from a runtime-owned identifier.
+    ///
+    /// Inbound IM adapter events must be unique across all providers and scopes
+    /// stored in one runtime state. Use `for_platform_delivery` when wrapping a
+    /// provider delivery id so duplicate detection cannot collide across
+    /// platforms, chats, or transport namespaces.
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
 
@@ -16,6 +22,35 @@ impl EventId {
         }
 
         Ok(Self(value))
+    }
+
+    pub fn for_platform_delivery(
+        platform: impl AsRef<str>,
+        scope: impl AsRef<str>,
+        delivery_id: impl AsRef<str>,
+    ) -> Result<Self, String> {
+        let platform = platform.as_ref();
+        let scope = scope.as_ref();
+        let delivery_id = delivery_id.as_ref();
+
+        if platform.trim().is_empty() {
+            return Err("event platform namespace must not be empty".to_owned());
+        }
+
+        if scope.trim().is_empty() {
+            return Err("event scope namespace must not be empty".to_owned());
+        }
+
+        if delivery_id.trim().is_empty() {
+            return Err("event delivery id must not be empty".to_owned());
+        }
+
+        Self::new(format!(
+            "platform_delivery_v1_{}_{}_{}",
+            encode_canonical_component(platform),
+            encode_canonical_component(scope),
+            encode_canonical_component(delivery_id)
+        ))
     }
 
     pub fn as_str(&self) -> &str {
@@ -147,6 +182,19 @@ impl Event {
     }
 }
 
+fn encode_canonical_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = format!("{:x}_", value.len());
+
+    for byte in value.as_bytes() {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Event, EventId, EventKind, EventSource, InboundEventRecord};
@@ -174,6 +222,30 @@ mod tests {
             serde_json::from_str::<EventId>("\"\"").expect_err("empty event id json should fail");
 
         assert!(err.to_string().contains("event id must not be empty"));
+    }
+
+    #[test]
+    fn platform_delivery_event_ids_include_provider_and_scope_namespace() {
+        let first =
+            EventId::for_platform_delivery("lark", "chat:oc_123", "delivery_1").expect("valid id");
+        let different_platform =
+            EventId::for_platform_delivery("slack", "chat:oc_123", "delivery_1").expect("valid id");
+        let different_scope =
+            EventId::for_platform_delivery("lark", "chat:oc_456", "delivery_1").expect("valid id");
+        let ambiguous_boundaries =
+            EventId::for_platform_delivery("la", "rk:chat", "oc_123:delivery_1").expect("valid id");
+
+        assert_ne!(first, different_platform);
+        assert_ne!(first, different_scope);
+        assert_ne!(first, ambiguous_boundaries);
+        assert!(first.as_str().starts_with("platform_delivery_v1_"));
+    }
+
+    #[test]
+    fn platform_delivery_event_ids_reject_empty_namespaces() {
+        assert!(EventId::for_platform_delivery("", "chat:oc_123", "delivery_1").is_err());
+        assert!(EventId::for_platform_delivery("lark", "  ", "delivery_1").is_err());
+        assert!(EventId::for_platform_delivery("lark", "chat:oc_123", "").is_err());
     }
 
     #[test]
