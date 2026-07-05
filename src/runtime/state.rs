@@ -18,10 +18,6 @@ use super::{
 };
 
 pub const RUNTIME_STATE_FILE_VERSION: u32 = 3;
-#[deprecated(
-    note = "runtime state schema versions belong to the state file; use RUNTIME_STATE_FILE_VERSION"
-)]
-pub const RUNTIME_STATE_VERSION: u32 = RUNTIME_STATE_FILE_VERSION;
 const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
 const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
 
@@ -136,13 +132,6 @@ impl RuntimeState {
 
         self.touch_at(finished_at_unix.max(unix_seconds_now()));
         Ok(())
-    }
-
-    #[deprecated(
-        note = "RuntimeState no longer owns the persisted file schema version; use RUNTIME_STATE_FILE_VERSION for the current file format"
-    )]
-    pub fn version(&self) -> u32 {
-        RUNTIME_STATE_FILE_VERSION
     }
 
     pub fn sessions(&self) -> &[Session] {
