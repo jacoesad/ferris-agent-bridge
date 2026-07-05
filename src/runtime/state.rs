@@ -1,11 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +25,8 @@ const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
 const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+static STATE_STORE_WRITE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeState {
@@ -257,6 +262,30 @@ impl RuntimeState {
             .fold(self.updated_at_unix, u64::max);
         self.updated_at_unix = updated_at_unix;
     }
+
+    fn preserve_inbound_events_from(&mut self, existing: &RuntimeState) -> Result<(), String> {
+        for existing_event in &existing.inbound_events {
+            match self
+                .inbound_events
+                .iter()
+                .find(|event| event.id() == existing_event.id())
+            {
+                Some(candidate_event) if candidate_event == existing_event => {}
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting inbound event record {}",
+                        existing_event.id()
+                    ));
+                }
+                None => {
+                    self.touch_at(existing_event.recorded_at_unix());
+                    self.inbound_events.push(existing_event.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for RuntimeState {
@@ -423,20 +452,31 @@ where
 
 #[derive(Debug, Clone)]
 pub struct StateStore {
+    inner: Arc<StateStoreInner>,
+}
+
+#[derive(Debug)]
+struct StateStoreInner {
     path: PathBuf,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl StateStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = state_store_lock_key(&path.into());
+        let write_lock = write_lock_for_path(&path);
+
+        Self {
+            inner: Arc::new(StateStoreInner { path, write_lock }),
+        }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
     pub fn load(&self) -> Result<RuntimeState, String> {
-        let input = match fs::read_to_string(&self.path) {
+        let input = match fs::read_to_string(self.path()) {
             Ok(input) => input,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Ok(RuntimeState::new());
@@ -444,39 +484,118 @@ impl StateStore {
             Err(err) => {
                 return Err(format!(
                     "failed to read runtime state {}: {err}",
-                    self.path.display()
+                    self.path().display()
                 ));
             }
         };
 
         let state_file: RuntimeStateFileWire = serde_json::from_str(&input)
-            .map_err(|err| format!("failed to parse {}: {err}", self.path.display()))?;
+            .map_err(|err| format!("failed to parse {}: {err}", self.path().display()))?;
         state_file
             .into_state()
-            .map_err(|err| format!("failed to parse {}: {err}", self.path.display()))
+            .map_err(|err| format!("failed to parse {}: {err}", self.path().display()))
     }
 
     pub fn save(&self, state: &RuntimeState) -> Result<(), String> {
-        state.validate()?;
-        let state_file = RuntimeStateFile::from_state(state);
-        write_json_atomic(&self.path, &state_file).map_err(|err| {
-            format!(
-                "failed to save runtime state {}: {err}",
-                self.path.display()
-            )
-        })
+        let _guard = self.lock_write()?;
+        self.save_unlocked(state)
     }
 
     pub fn persist_inbound_event(&self, event: &Event) -> Result<InboundEventRecordStatus, String> {
+        let _guard = self.lock_write()?;
         let mut state = self.load()?;
         let record_status = state.record_inbound_event(event)?;
 
         if record_status == InboundEventRecordStatus::Recorded {
-            self.save(&state)?;
+            self.save_unlocked(&state)?;
         }
 
         Ok(record_status)
     }
+
+    fn save_unlocked(&self, state: &RuntimeState) -> Result<(), String> {
+        let mut state = state.clone();
+        if let Some(existing) = self.load_existing_for_merge()? {
+            state.preserve_inbound_events_from(&existing)?;
+        }
+
+        state.validate()?;
+        let state_file = RuntimeStateFile::from_state(&state);
+        write_json_atomic(self.path(), &state_file).map_err(|err| {
+            format!(
+                "failed to save runtime state {}: {err}",
+                self.path().display()
+            )
+        })
+    }
+
+    fn lock_write(&self) -> Result<MutexGuard<'_, ()>, String> {
+        self.inner
+            .write_lock
+            .lock()
+            .map_err(|_| "runtime state write lock poisoned".to_owned())
+    }
+
+    fn load_existing_for_merge(&self) -> Result<Option<RuntimeState>, String> {
+        let input = match fs::read_to_string(self.path()) {
+            Ok(input) => input,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(format!(
+                    "failed to read runtime state {}: {err}",
+                    self.path().display()
+                ));
+            }
+        };
+
+        let state_file: RuntimeStateFileWire = serde_json::from_str(&input)
+            .map_err(|err| format!("failed to parse {}: {err}", self.path().display()))?;
+        state_file
+            .into_state()
+            .map(Some)
+            .map_err(|err| format!("failed to parse {}: {err}", self.path().display()))
+    }
+}
+
+fn write_lock_for_path(path: &Path) -> Arc<Mutex<()>> {
+    let key = state_store_lock_key(path);
+    let registry = STATE_STORE_WRITE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = match registry.lock() {
+        Ok(locks) => locks,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn state_store_lock_key(path: &Path) -> PathBuf {
+    if let Ok(canonical_path) = fs::canonicalize(path) {
+        return canonical_path;
+    }
+
+    if let Some(parent) = non_empty_parent(path) {
+        if let (Ok(canonical_parent), Some(file_name)) =
+            (fs::canonicalize(parent), path.file_name())
+        {
+            return canonical_parent.join(file_name);
+        }
+    }
+
+    std::path::absolute(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
 }
 
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
@@ -652,7 +771,11 @@ fn unix_seconds_now() -> u64 {
 mod tests {
     use std::{
         fs,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
+        thread,
     };
 
     use super::{RuntimeState, StateStore, non_empty_parent, open_private_new_file};
@@ -858,6 +981,133 @@ mod tests {
         let loaded = store.load().expect("state should load");
         assert_eq!(loaded.inbound_events().len(), 1);
         assert_eq!(loaded.inbound_events()[0], first_record);
+    }
+
+    #[test]
+    fn state_store_uses_same_process_write_lock_for_same_path() {
+        let path = test_path("state-same-path-lock").join("runtime.state.json");
+        let first = StateStore::new(&path);
+        let second = StateStore::new(&path);
+
+        assert!(Arc::ptr_eq(
+            &first.inner.write_lock,
+            &second.inner.write_lock
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_store_normalizes_symlinked_parent_paths_for_io_and_locking() {
+        let root = test_path("state-symlink-path-lock");
+        let real_parent = root.join("real");
+        let linked_parent = root.join("linked");
+        fs::create_dir(&real_parent).expect("real parent should exist");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent)
+            .expect("parent symlink should be created");
+
+        let real_store = StateStore::new(real_parent.join("runtime.state.json"));
+        let linked_store = StateStore::new(linked_parent.join("runtime.state.json"));
+
+        assert_eq!(real_store.path(), linked_store.path());
+        assert!(Arc::ptr_eq(
+            &real_store.inner.write_lock,
+            &linked_store.inner.write_lock
+        ));
+    }
+
+    #[test]
+    fn state_store_serializes_inbound_event_persistence_across_same_path_handles() {
+        let path = test_path("state-inbound-event-concurrent-ack").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+
+        for index in 0..worker_count {
+            let worker_store = StateStore::new(&path);
+            let worker_barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                let event = event_fixture(&format!("evt_{index}"), 10 + index as u64);
+                worker_barrier.wait();
+
+                let status = worker_store
+                    .persist_inbound_event(&event)
+                    .expect("concurrent event should persist");
+
+                (event.id, status)
+            }));
+        }
+
+        let mut recorded_event_ids = Vec::new();
+        for worker in workers {
+            let (event_id, status) = worker.join().expect("worker should not panic");
+            assert_eq!(status, InboundEventRecordStatus::Recorded);
+            recorded_event_ids.push(event_id);
+        }
+
+        let loaded = store.load().expect("state should load");
+        assert_eq!(loaded.inbound_events().len(), worker_count);
+        for event_id in recorded_event_ids {
+            assert!(
+                loaded.has_inbound_event(&event_id),
+                "acknowledged event {event_id} must remain durable"
+            );
+        }
+    }
+
+    #[test]
+    fn state_store_save_preserves_inbound_events_from_stale_snapshot() {
+        let path = test_path("state-stale-save-preserves-inbound").join("runtime.state.json");
+        let stale_writer = StateStore::new(&path);
+        let ack_writer = StateStore::new(&path);
+        let stale_snapshot = stale_writer.load().expect("empty state should load");
+        let event = event_fixture("evt_1", 10);
+
+        let status = ack_writer
+            .persist_inbound_event(&event)
+            .expect("event should persist before acknowledgement");
+        assert_eq!(status, InboundEventRecordStatus::Recorded);
+
+        stale_writer
+            .save(&stale_snapshot)
+            .expect("stale save should preserve acknowledged inbound records");
+
+        let loaded = StateStore::new(&path).load().expect("state should load");
+        assert!(
+            loaded.has_inbound_event(&event.id),
+            "stale save must not erase an acknowledged inbound record"
+        );
+    }
+
+    #[test]
+    fn state_store_save_fails_closed_when_existing_state_is_invalid() {
+        let path = test_path("state-save-invalid-existing").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let event = event_fixture("evt_1", 10);
+        let record = state_event_record(&event, 12).expect("inbound event record should build");
+        fs::write(
+            store.path(),
+            format!(
+                r#"{{
+                    "version": {version},
+                    "sessions": [],
+                    "runs": [],
+                    "inbound_events": [{record}],
+                    "updated_at_unix": 1
+                }}"#,
+                version = super::RUNTIME_STATE_FILE_VERSION,
+                record = serde_json::to_string(&record).expect("event record should encode")
+            ),
+        )
+        .expect("invalid state fixture should write");
+
+        let err = store
+            .save(&RuntimeState::new())
+            .expect_err("save should not overwrite invalid existing state");
+
+        assert!(err.contains("before inbound event"));
+        let existing = fs::read_to_string(store.path()).expect("state file should remain readable");
+        assert!(existing.contains("evt_1"));
     }
 
     #[test]
