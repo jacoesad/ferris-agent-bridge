@@ -10,9 +10,13 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, de, de::DeserializeOwned};
 
-use super::session::{Session, SessionId};
+use super::{
+    run::{RunId, RunRecord},
+    session::{Session, SessionId},
+};
 
-pub const RUNTIME_STATE_VERSION: u32 = 1;
+pub const RUNTIME_STATE_VERSION: u32 = 2;
+const RUNTIME_STATE_V1_VERSION: u32 = 1;
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -20,6 +24,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 pub struct RuntimeState {
     version: u32,
     sessions: Vec<Session>,
+    runs: Vec<RunRecord>,
     updated_at_unix: u64,
 }
 
@@ -28,6 +33,7 @@ impl RuntimeState {
         Self {
             version: RUNTIME_STATE_VERSION,
             sessions: Vec::new(),
+            runs: Vec::new(),
             updated_at_unix: unix_seconds_now(),
         }
     }
@@ -43,11 +49,67 @@ impl RuntimeState {
             self.sessions.push(session);
         }
 
-        self.updated_at_unix = unix_seconds_now();
+        self.touch_at(unix_seconds_now());
     }
 
     pub fn session(&self, id: &SessionId) -> Option<&Session> {
         self.sessions.iter().find(|session| session.id() == id)
+    }
+
+    pub fn add_run(&mut self, run: RunRecord) -> Result<(), String> {
+        self.validate_run_session(&run)?;
+
+        if self.runs.iter().any(|existing| existing.id() == run.id()) {
+            return Err(format!("duplicate run id {}", run.id()));
+        }
+
+        self.runs.push(run);
+        self.touch_at(unix_seconds_now());
+        Ok(())
+    }
+
+    pub fn run(&self, id: &RunId) -> Option<&RunRecord> {
+        self.runs.iter().find(|run| run.id() == id)
+    }
+
+    pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {
+        {
+            let run = self.run_mut(id)?;
+            run.start(started_at_unix)?;
+        }
+
+        self.touch_at(started_at_unix.max(unix_seconds_now()));
+        Ok(())
+    }
+
+    pub fn complete_run(&mut self, id: &RunId, finished_at_unix: u64) -> Result<(), String> {
+        {
+            let run = self.run_mut(id)?;
+            run.complete(finished_at_unix)?;
+        }
+
+        self.touch_at(finished_at_unix.max(unix_seconds_now()));
+        Ok(())
+    }
+
+    pub fn fail_run(&mut self, id: &RunId, finished_at_unix: u64) -> Result<(), String> {
+        {
+            let run = self.run_mut(id)?;
+            run.fail(finished_at_unix)?;
+        }
+
+        self.touch_at(finished_at_unix.max(unix_seconds_now()));
+        Ok(())
+    }
+
+    pub fn cancel_run(&mut self, id: &RunId, finished_at_unix: u64) -> Result<(), String> {
+        {
+            let run = self.run_mut(id)?;
+            run.cancel(finished_at_unix)?;
+        }
+
+        self.touch_at(finished_at_unix.max(unix_seconds_now()));
+        Ok(())
     }
 
     pub fn version(&self) -> u32 {
@@ -56,6 +118,10 @@ impl RuntimeState {
 
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
+    }
+
+    pub fn runs(&self) -> &[RunRecord] {
+        &self.runs
     }
 
     pub fn updated_at_unix(&self) -> u64 {
@@ -71,6 +137,7 @@ impl RuntimeState {
         }
 
         let mut session_ids = BTreeSet::new();
+        let mut run_ids = BTreeSet::new();
 
         for session in &self.sessions {
             session.validate()?;
@@ -80,7 +147,39 @@ impl RuntimeState {
             }
         }
 
+        for run in &self.runs {
+            run.validate()?;
+            self.validate_run_session(run)?;
+
+            if !run_ids.insert(run.id()) {
+                return Err(format!("duplicate run id {}", run.id()));
+            }
+        }
+
         Ok(())
+    }
+
+    fn validate_run_session(&self, run: &RunRecord) -> Result<(), String> {
+        if self.session(run.session_id()).is_none() {
+            return Err(format!(
+                "run {} references unknown session {}",
+                run.id(),
+                run.session_id()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn run_mut(&mut self, id: &RunId) -> Result<&mut RunRecord, String> {
+        self.runs
+            .iter_mut()
+            .find(|run| run.id() == id)
+            .ok_or_else(|| format!("unknown run id {id}"))
+    }
+
+    fn touch_at(&mut self, updated_at_unix: u64) {
+        self.updated_at_unix = self.updated_at_unix.max(updated_at_unix);
     }
 }
 
@@ -99,13 +198,37 @@ impl<'de> Deserialize<'de> for RuntimeState {
         struct RuntimeStateWire {
             version: u32,
             sessions: Vec<Session>,
+            runs: Option<Vec<RunRecord>>,
             updated_at_unix: u64,
         }
 
         let wire = RuntimeStateWire::deserialize(deserializer)?;
+        let runs = match wire.version {
+            RUNTIME_STATE_V1_VERSION => {
+                if wire.runs.is_some() {
+                    return Err(de::Error::custom(
+                        "runtime state version 1 must not contain run records",
+                    ));
+                }
+
+                Vec::new()
+            }
+            RUNTIME_STATE_VERSION => wire.runs.ok_or_else(|| {
+                de::Error::custom(format!(
+                    "runtime state version {RUNTIME_STATE_VERSION} must contain run records"
+                ))
+            })?,
+            version => {
+                return Err(de::Error::custom(format!(
+                    "unsupported runtime state version {}; expected {}",
+                    version, RUNTIME_STATE_VERSION
+                )));
+            }
+        };
         let state = Self {
-            version: wire.version,
+            version: RUNTIME_STATE_VERSION,
             sessions: wire.sessions,
+            runs,
             updated_at_unix: wire.updated_at_unix,
         };
         state.validate().map_err(de::Error::custom)?;
@@ -335,7 +458,10 @@ mod tests {
     };
 
     use super::{RuntimeState, StateStore, non_empty_parent, open_private_new_file};
-    use crate::runtime::session::{Session, SessionScope};
+    use crate::runtime::{
+        run::{RunId, RunRecord, RunStatus},
+        session::{Session, SessionScope},
+    };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -354,6 +480,102 @@ mod tests {
 
         assert!(loaded.session(&session_id).is_some());
         assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn state_store_round_trips_run_records() {
+        let path = test_path("state-run-round-trip").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let run_id = RunId::new("run_1").expect("valid run id");
+        let mut run = RunRecord::new(run_id.clone(), session_id, 10);
+        run.start(11).expect("run should start");
+        run.complete(12).expect("run should complete");
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state.add_run(run).expect("run should be accepted");
+
+        store.save(&state).expect("state should save");
+        let loaded = store.load().expect("state should load");
+
+        assert_eq!(
+            loaded
+                .run(&run_id)
+                .expect("persisted run should exist")
+                .status(),
+            RunStatus::Completed
+        );
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn state_transitions_persisted_run_records() {
+        let (mut state, run_id) = state_with_pending_run("run_1");
+
+        state.start_run(&run_id, 11).expect("run should start");
+        state
+            .complete_run(&run_id, 12)
+            .expect("run should complete");
+
+        let run = state.run(&run_id).expect("run should exist");
+        assert_eq!(run.status(), RunStatus::Completed);
+        assert_eq!(run.started_at_unix(), Some(11));
+        assert_eq!(run.finished_at_unix(), Some(12));
+    }
+
+    #[test]
+    fn state_transitions_can_fail_or_cancel_persisted_run_records() {
+        let (mut failed, failed_id) = state_with_pending_run("run_failed");
+        failed
+            .fail_run(&failed_id, 11)
+            .expect("pending run can fail");
+        assert_eq!(
+            failed.run(&failed_id).expect("run should exist").status(),
+            RunStatus::Failed
+        );
+
+        let (mut cancelled, cancelled_id) = state_with_pending_run("run_cancelled");
+        cancelled
+            .start_run(&cancelled_id, 11)
+            .expect("run should start");
+        cancelled
+            .cancel_run(&cancelled_id, 12)
+            .expect("running run can cancel");
+        assert_eq!(
+            cancelled
+                .run(&cancelled_id)
+                .expect("run should exist")
+                .status(),
+            RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn state_transitions_reject_invalid_or_unknown_runs() {
+        let (mut state, run_id) = state_with_pending_run("run_1");
+        let unknown_id = RunId::new("run_missing").expect("valid run id");
+
+        let err = state
+            .complete_run(&run_id, 11)
+            .expect_err("pending run should not complete");
+        assert!(err.contains("cannot complete from Pending"));
+
+        let err = state
+            .start_run(&unknown_id, 11)
+            .expect_err("unknown run should not start");
+        assert!(err.contains("unknown run id"));
+
+        state.start_run(&run_id, 11).expect("run should start");
+        state
+            .complete_run(&run_id, 12)
+            .expect("run should complete");
+
+        let err = state
+            .start_run(&run_id, 13)
+            .expect_err("terminal run should not restart");
+        assert!(err.contains("cannot start from Completed"));
     }
 
     #[test]
@@ -408,6 +630,80 @@ mod tests {
         let state = store.load().expect("missing state should be defaulted");
 
         assert!(state.sessions().is_empty());
+        assert!(state.runs().is_empty());
+    }
+
+    #[test]
+    fn state_load_migrates_version_1_without_runs_field() {
+        let path = test_path("state-v1-without-runs-field").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "sessions": [],
+                "updated_at_unix": 1
+            }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 1 state without runs should migrate");
+
+        assert_eq!(state.version(), super::RUNTIME_STATE_VERSION);
+        assert!(state.runs().is_empty());
+    }
+
+    #[test]
+    fn state_load_rejects_version_1_with_run_records() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let run = RunRecord::new(RunId::new("run_1").expect("valid run id"), session_id, 10);
+        let path = test_path("state-v1-with-runs").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": 1,
+                "sessions": [{session}],
+                "runs": [{run}],
+                "updated_at_unix": 1
+            }}"#,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            run = serde_json::to_string(&run).expect("run should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 1 state must not carry run records");
+
+        assert!(err.contains("version 1 must not contain run records"));
+    }
+
+    #[test]
+    fn state_load_rejects_current_version_without_run_records() {
+        let path = test_path("state-v2-without-runs").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                    "version": {},
+                    "sessions": [],
+                    "updated_at_unix": 1
+                }}"#,
+                super::RUNTIME_STATE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must carry run records");
+
+        assert!(err.contains("must contain run records"));
     }
 
     #[test]
@@ -514,6 +810,60 @@ mod tests {
     }
 
     #[test]
+    fn state_validation_rejects_duplicate_run_ids() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let run = RunRecord::new(RunId::new("run_1").expect("valid run id"), session_id, 10);
+        let path = test_path("state-duplicate-run-ids").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": {version},
+                "sessions": [{session}],
+                "runs": [{run}, {run}],
+                "updated_at_unix": 1
+            }}"#,
+            version = super::RUNTIME_STATE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            run = serde_json::to_string(&run).expect("run should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("duplicate run ids should be rejected");
+
+        assert!(err.contains("duplicate run id"));
+    }
+
+    #[test]
+    fn state_validation_rejects_run_without_session() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session_id = crate::runtime::session::SessionId::for_scope(&scope);
+        let run = RunRecord::new(RunId::new("run_1").expect("valid run id"), session_id, 10);
+        let path = test_path("state-run-without-session").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": {version},
+                "sessions": [],
+                "runs": [{run}],
+                "updated_at_unix": 1
+            }}"#,
+            version = super::RUNTIME_STATE_VERSION,
+            run = serde_json::to_string(&run).expect("run should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("run without known session should be rejected");
+
+        assert!(err.contains("references unknown session"));
+    }
+
+    #[test]
     fn state_load_rejects_session_id_scope_mismatch() {
         let path = test_path("state-session-id-mismatch").join("runtime.state.json");
         fs::write(
@@ -597,5 +947,18 @@ mod tests {
             scope.scope()
         ))
         .expect("session fixture should decode")
+    }
+
+    fn state_with_pending_run(run_id: &str) -> (RuntimeState, RunId) {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let run_id = RunId::new(run_id).expect("valid run id");
+        let run = RunRecord::new(run_id.clone(), session_id, 10);
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state.add_run(run).expect("run should be accepted");
+
+        (state, run_id)
     }
 }
