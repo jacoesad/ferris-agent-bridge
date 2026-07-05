@@ -1256,6 +1256,34 @@ mod tests {
     }
 
     #[test]
+    fn state_load_rejects_unknown_inbound_event_fields() {
+        let path = test_path("state-unknown-inbound-event-fields").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [{{
+                    "id": "evt_1",
+                    "received_at_unix": 10,
+                    "recorded_at_unix": 12,
+                    "future_field": true
+                }}],
+                "updated_at_unix": 1
+            }}"#,
+            super::RUNTIME_STATE_FILE_VERSION
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown inbound event fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn state_load_does_not_default_non_not_found_path_errors() {
         let dir = test_path("state-load-path-error");

@@ -94,6 +94,7 @@ impl<'de> Deserialize<'de> for InboundEventRecord {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct InboundEventRecordWire {
             id: EventId,
             received_at_unix: u64,
@@ -214,6 +215,21 @@ mod tests {
             err.to_string()
                 .contains("recorded_at_unix before received_at_unix")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_inbound_event_record_fields_from_json() {
+        let err = serde_json::from_str::<InboundEventRecord>(
+            r#"{
+                "id": "evt_1",
+                "received_at_unix": 10,
+                "recorded_at_unix": 12,
+                "future_field": true
+            }"#,
+        )
+        .expect_err("unknown inbound event record fields must not be dropped");
+
+        assert!(err.to_string().contains("unknown field `future_field`"));
     }
 
     fn event_fixture(id: &str, received_at_unix: u64) -> Event {
