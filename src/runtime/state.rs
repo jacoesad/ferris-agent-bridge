@@ -466,6 +466,17 @@ impl StateStore {
             )
         })
     }
+
+    pub fn persist_inbound_event(&self, event: &Event) -> Result<InboundEventRecordStatus, String> {
+        let mut state = self.load()?;
+        let record_status = state.record_inbound_event(event)?;
+
+        if record_status == InboundEventRecordStatus::Recorded {
+            self.save(&state)?;
+        }
+
+        Ok(record_status)
+    }
 }
 
 pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
@@ -799,6 +810,84 @@ mod tests {
         );
         assert_eq!(state.inbound_events().len(), 1);
         assert_eq!(state.updated_at_unix(), 20);
+    }
+
+    #[test]
+    fn state_store_persists_inbound_event_before_returning_status() {
+        let path = test_path("state-inbound-event-ack-after-persist").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let event = event_fixture("evt_1", 10);
+
+        let status = store
+            .persist_inbound_event(&event)
+            .expect("persisted event should return a status that may be acknowledged");
+
+        assert_eq!(status, InboundEventRecordStatus::Recorded);
+
+        let loaded = store.load().expect("state should load");
+        let record = loaded
+            .inbound_event(&event.id)
+            .expect("status must only be returned after the event is persisted");
+        assert_eq!(record.received_at_unix(), 10);
+        assert!(record.recorded_at_unix() >= 10);
+    }
+
+    #[test]
+    fn state_store_returns_duplicate_status_after_existing_record() {
+        let path = test_path("state-inbound-event-duplicate-ack").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let event = event_fixture("evt_1", 10);
+
+        let first = store
+            .persist_inbound_event(&event)
+            .expect("first event should persist");
+        assert_eq!(first, InboundEventRecordStatus::Recorded);
+
+        let before_duplicate = store.load().expect("state should load");
+        let first_record = before_duplicate
+            .inbound_event(&event.id)
+            .expect("event should be persisted")
+            .clone();
+
+        let duplicate = store
+            .persist_inbound_event(&event)
+            .expect("duplicate event should still return a status that may be acknowledged");
+
+        assert_eq!(duplicate, InboundEventRecordStatus::Duplicate);
+
+        let loaded = store.load().expect("state should load");
+        assert_eq!(loaded.inbound_events().len(), 1);
+        assert_eq!(loaded.inbound_events()[0], first_record);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn state_store_does_not_return_status_when_inbound_event_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_path("state-inbound-event-persist-failure");
+        let path = dir.join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let event = event_fixture("evt_1", 10);
+
+        store
+            .save(&RuntimeState::new())
+            .expect("initial readable state should save");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
+            .expect("fixture permissions should be set");
+
+        let result = store.persist_inbound_event(&event);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions should be restored");
+        let err = result.expect_err("failed persistence must not return an acknowledgeable status");
+        assert!(err.contains("failed to save runtime state"));
+
+        let loaded = store.load().expect("state should still load");
+        assert!(
+            loaded.inbound_events().is_empty(),
+            "failed persistence must not leave an acknowledged inbound event on disk"
+        );
     }
 
     #[test]
