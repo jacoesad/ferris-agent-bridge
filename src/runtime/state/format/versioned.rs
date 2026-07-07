@@ -1,0 +1,544 @@
+use crate::runtime::{event::InboundEventRecord, outbox::OutboundDeliveryRecord, run::RunRecord};
+
+use super::{
+    current::{
+        RUNTIME_STATE_FILE_V1_VERSION, RUNTIME_STATE_FILE_V2_VERSION,
+        RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_VERSION,
+    },
+    wire::WireField,
+};
+
+pub(super) struct PersistedCollections {
+    pub(super) runs: Vec<RunRecord>,
+    pub(super) inbound_events: Vec<InboundEventRecord>,
+    pub(super) outbound_deliveries: Vec<OutboundDeliveryRecord>,
+    pub(super) normalize_aggregate_updated_at: bool,
+}
+
+pub(super) fn decode_persisted_collections(
+    version: u32,
+    runs: WireField<Vec<RunRecord>>,
+    inbound_events: WireField<Vec<InboundEventRecord>>,
+    outbound_deliveries: WireField<Vec<OutboundDeliveryRecord>>,
+) -> Result<PersistedCollections, String> {
+    let (runs, inbound_events, outbound_deliveries, normalize_aggregate_updated_at) = match version
+    {
+        RUNTIME_STATE_FILE_V1_VERSION => {
+            if runs.is_present() {
+                return Err("runtime state version 1 must not contain run records".to_string());
+            }
+
+            if inbound_events.is_present() {
+                return Err(
+                    "runtime state version 1 must not contain inbound event records".to_string(),
+                );
+            }
+
+            if outbound_deliveries.is_present() {
+                return Err(
+                    "runtime state version 1 must not contain outbound deliveries".to_string(),
+                );
+            }
+
+            (Vec::new(), Vec::new(), Vec::new(), true)
+        }
+        RUNTIME_STATE_FILE_V2_VERSION => {
+            let runs = runs.into_required("runtime state version 2 must contain run records")?;
+
+            if inbound_events.is_present() {
+                return Err(
+                    "runtime state version 2 must not contain inbound event records".to_string(),
+                );
+            }
+
+            if outbound_deliveries.is_present() {
+                return Err(
+                    "runtime state version 2 must not contain outbound deliveries".to_string(),
+                );
+            }
+
+            (runs, Vec::new(), Vec::new(), true)
+        }
+        RUNTIME_STATE_FILE_V3_VERSION => {
+            let runs = runs.into_required("runtime state version 3 must contain run records")?;
+            let inbound_events = inbound_events
+                .into_required("runtime state version 3 must contain inbound event records")?;
+
+            if outbound_deliveries.is_present() {
+                return Err(
+                    "runtime state version 3 must not contain outbound deliveries".to_string(),
+                );
+            }
+
+            (runs, inbound_events, Vec::new(), false)
+        }
+        RUNTIME_STATE_FILE_VERSION => {
+            let runs = runs.into_required(format!(
+                "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain run records"
+            ))?;
+            let inbound_events = inbound_events.into_required(format!(
+                "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain inbound event records"
+            ))?;
+            let outbound_deliveries = outbound_deliveries.into_required(format!(
+                "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain outbound deliveries"
+            ))?;
+
+            (runs, inbound_events, outbound_deliveries, false)
+        }
+        version => {
+            return Err(format!(
+                "unsupported runtime state version {}; expected {}",
+                version, RUNTIME_STATE_FILE_VERSION
+            ));
+        }
+    };
+
+    Ok(PersistedCollections {
+        runs,
+        inbound_events,
+        outbound_deliveries,
+        normalize_aggregate_updated_at,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use crate::runtime::{
+        run::{RunId, RunRecord},
+        session::{Session, SessionScope},
+        state::StateStore,
+    };
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn state_load_migrates_released_version_1_without_runs_or_inbound_event_records() {
+        let path = test_path("state-v1-released-shape").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 1,
+            "sessions": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("released version 1 state should migrate");
+
+        assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+    }
+    #[test]
+    fn state_load_migrates_version_1_stale_aggregate_updated_at() {
+        let path = test_path("state-v1-stale-aggregate-updated-at").join("runtime.state.json");
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 20);
+        let encoded = format!(
+            r#"{{
+            "version": 1,
+            "sessions": [{session}],
+            "updated_at_unix": 1
+        }}"#,
+            session = serde_json::to_string(&session).expect("session should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 1 state should normalize aggregate timestamps while migrating");
+
+        assert_eq!(state.updated_at_unix(), 20);
+        assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+    }
+    #[test]
+    fn state_load_rejects_version_1_with_run_records() {
+        let path = test_path("state-v1-with-runs").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 1,
+            "sessions": [],
+            "runs": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 1 state must not carry run records");
+
+        assert!(err.contains("version 1 must not contain run records"));
+    }
+    #[test]
+    fn state_load_rejects_version_1_with_null_run_records() {
+        let path = test_path("state-v1-with-null-runs").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 1,
+            "sessions": [],
+            "runs": null,
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 1 state must reject present null runs");
+
+        assert!(err.contains("version 1 must not contain run records"));
+    }
+    #[test]
+    fn state_load_rejects_version_1_with_inbound_event_records() {
+        let path = test_path("state-v1-with-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 1,
+            "sessions": [],
+            "inbound_events": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 1 state must not carry inbound event records");
+
+        assert!(err.contains("version 1 must not contain inbound event records"));
+    }
+    #[test]
+    fn state_load_migrates_version_2_without_inbound_event_records() {
+        let path = test_path("state-v2-without-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 2,
+            "sessions": [],
+            "runs": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 2 state without inbound event records should migrate");
+
+        assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+    }
+    #[test]
+    fn state_load_migrates_version_2_stale_aggregate_updated_at() {
+        let path = test_path("state-v2-stale-aggregate-updated-at").join("runtime.state.json");
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 2);
+        let run = RunRecord::new(
+            RunId::new("run_1").expect("valid run id"),
+            session.id().clone(),
+            20,
+        );
+        let encoded = format!(
+            r#"{{
+            "version": 2,
+            "sessions": [{session}],
+            "runs": [{run}],
+            "updated_at_unix": 1
+        }}"#,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            run = serde_json::to_string(&run).expect("run should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 2 state should normalize aggregate timestamps while migrating");
+
+        assert_eq!(state.updated_at_unix(), 20);
+        assert_eq!(state.runs().len(), 1);
+        assert!(state.inbound_events().is_empty());
+    }
+    #[test]
+    fn state_load_rejects_version_2_with_inbound_event_records() {
+        let path = test_path("state-v2-with-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 2,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 2 state must not carry inbound event records");
+
+        assert!(err.contains("version 2 must not contain inbound event records"));
+    }
+    #[test]
+    fn state_load_rejects_version_2_with_null_inbound_event_records() {
+        let path = test_path("state-v2-with-null-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 2,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": null,
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 2 state must reject present null inbound event records");
+
+        assert!(err.contains("version 2 must not contain inbound event records"));
+    }
+    #[test]
+    fn state_load_migrates_version_3_without_outbound_deliveries() {
+        let path = test_path("state-v3-without-outbound-deliveries").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 3,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 3 state without outbound deliveries should migrate");
+
+        assert!(state.runs().is_empty());
+        assert!(state.inbound_events().is_empty());
+        assert!(state.outbound_deliveries().is_empty());
+    }
+    #[test]
+    fn state_load_rejects_version_3_with_outbound_deliveries() {
+        let path = test_path("state-v3-with-outbound-deliveries").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 3,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 3 state must not carry outbound deliveries");
+
+        assert!(err.contains("version 3 must not contain outbound deliveries"));
+    }
+    #[test]
+    fn state_load_rejects_future_file_version() {
+        let path = test_path("state-future-version").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 5,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("future state versions must not be loaded");
+
+        assert!(err.contains("unsupported runtime state version 5; expected 4"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_without_run_records() {
+        let path = test_path("state-v3-without-runs").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must carry run records");
+
+        assert!(err.contains("must contain run records"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_without_inbound_event_records() {
+        let path = test_path("state-v3-without-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must carry inbound events");
+
+        assert!(err.contains("must contain inbound event records"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_with_null_inbound_event_records() {
+        let path = test_path("state-v3-with-null-inbound-events").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": null,
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must reject null inbound events");
+
+        assert!(err.contains("must contain inbound event records"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_without_outbound_deliveries() {
+        let path = test_path("state-v4-without-outbound-deliveries").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must carry outbound deliveries");
+
+        assert!(err.contains("must contain outbound deliveries"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_with_null_outbound_deliveries() {
+        let path = test_path("state-v4-with-null-outbound-deliveries").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [],
+                "outbound_deliveries": null,
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must reject null outbound deliveries");
+
+        assert!(err.contains("must contain outbound deliveries"));
+    }
+    fn test_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ferris-agent-bridge-{name}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("test dir should exist");
+        path
+    }
+    fn session_fixture(
+        scope: &SessionScope,
+        created_at_unix: u64,
+        updated_at_unix: u64,
+    ) -> Session {
+        serde_json::from_str(&format!(
+            r#"{{
+            "id": "{}",
+            "scope": {{"platform": "{}", "scope": "{}"}},
+            "created_at_unix": {created_at_unix},
+            "updated_at_unix": {updated_at_unix}
+        }}"#,
+            crate::runtime::session::SessionId::for_scope(scope),
+            scope.platform(),
+            scope.scope()
+        ))
+        .expect("session fixture should decode")
+    }
+}
