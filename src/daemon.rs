@@ -57,19 +57,22 @@ use cleanup::{
 use files::{append_log, open_log_file, read_record, write_private_file, write_record};
 #[cfg(test)]
 use files::{remove_file_if_exists, write_new_record};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use lifecycle::{
     FileSnapshot, StaleLifecycleLock, cleanup_incomplete_lifecycle_lock_if_matches,
-    create_lifecycle_lock, inspect_stale_lifecycle_lock, lifecycle_lock_contents,
-    read_lifecycle_lock_token,
+    inspect_stale_lifecycle_lock, lifecycle_lock_contents,
 };
 use lifecycle::{LifecycleLockGuard, acquire_lifecycle_lock};
+#[cfg(test)]
+use lifecycle::{create_lifecycle_lock, read_lifecycle_lock_token};
+#[cfg(all(test, unix))]
+use process_ops::kill_zero_stderr_indicates_live_process;
+#[cfg(test)]
+use process_ops::record_matches_process;
 use process_ops::{
     ProcessIdentity, current_exe_string, detach_background_command, generate_token,
     inspect_process_identity, is_process_running, terminate_process,
 };
-#[cfg(test)]
-use process_ops::{kill_zero_stderr_indicates_live_process, record_matches_process};
 use startup::{acquire_start_lock, validate_startup_lock};
 use status::inspect_status;
 #[cfg(test)]

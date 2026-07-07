@@ -1,5 +1,5 @@
 use std::{
-    env, io,
+    env,
     process::{self, Command},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -78,6 +78,7 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 pub(super) fn detach_background_command(command: &mut Command) {
+    use std::io;
     use std::os::unix::process::CommandExt;
 
     // SAFETY: pre_exec runs in the child after fork and before exec. The closure

@@ -181,8 +181,6 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::open_private_new_file;
-
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     #[test]
@@ -191,7 +189,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = test_path("private-new-file").join("secret.tmp");
-        let file = open_private_new_file(&path).expect("private file should be created");
+        let file = super::open_private_new_file(&path).expect("private file should be created");
 
         let mode = file
             .metadata()
