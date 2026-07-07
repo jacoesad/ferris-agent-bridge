@@ -7,6 +7,10 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::runtime::{
     event::{Event, EventId, InboundEventRecord, InboundEventRecordStatus},
+    outbox::{
+        OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
+        OutboundDeliveryStatus,
+    },
     run::{RunId, RunRecord},
     session::{Session, SessionId},
 };
@@ -16,6 +20,7 @@ pub struct RuntimeState {
     sessions: Vec<Session>,
     runs: Vec<RunRecord>,
     inbound_events: Vec<InboundEventRecord>,
+    outbound_deliveries: Vec<OutboundDeliveryRecord>,
     updated_at_unix: u64,
 }
 
@@ -25,6 +30,7 @@ impl RuntimeState {
             sessions: Vec::new(),
             runs: Vec::new(),
             inbound_events: Vec::new(),
+            outbound_deliveries: Vec::new(),
             updated_at_unix: unix_seconds_now(),
         }
     }
@@ -82,6 +88,41 @@ impl RuntimeState {
         self.inbound_event(id).is_some()
     }
 
+    pub fn enqueue_outbound_delivery(
+        &mut self,
+        delivery: OutboundDeliveryRecord,
+    ) -> Result<OutboundDeliveryEnqueueStatus, String> {
+        delivery.validate()?;
+        self.validate_outbound_delivery_session(&delivery)?;
+
+        if delivery.status() != OutboundDeliveryStatus::Pending {
+            return Err(format!(
+                "outbound delivery {} cannot enqueue from {:?}",
+                delivery.id(),
+                delivery.status()
+            ));
+        }
+
+        if let Some(existing) = self.outbound_delivery(delivery.id()) {
+            if existing == &delivery {
+                return Ok(OutboundDeliveryEnqueueStatus::Duplicate);
+            }
+
+            return Err(format!("conflicting outbound delivery {}", delivery.id()));
+        }
+
+        let updated_at_unix = delivery.updated_at_unix();
+        self.outbound_deliveries.push(delivery);
+        self.touch_at(updated_at_unix.max(unix_seconds_now()));
+        Ok(OutboundDeliveryEnqueueStatus::Queued)
+    }
+
+    pub fn outbound_delivery(&self, id: &OutboundDeliveryId) -> Option<&OutboundDeliveryRecord> {
+        self.outbound_deliveries
+            .iter()
+            .find(|delivery| delivery.id() == id)
+    }
+
     pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {
         {
             let run = self.run_mut(id)?;
@@ -134,6 +175,10 @@ impl RuntimeState {
         &self.inbound_events
     }
 
+    pub fn outbound_deliveries(&self) -> &[OutboundDeliveryRecord] {
+        &self.outbound_deliveries
+    }
+
     pub fn updated_at_unix(&self) -> u64 {
         self.updated_at_unix
     }
@@ -142,6 +187,7 @@ impl RuntimeState {
         let mut session_ids = BTreeSet::new();
         let mut run_ids = BTreeSet::new();
         let mut inbound_event_ids = BTreeSet::new();
+        let mut outbound_delivery_ids = BTreeSet::new();
 
         for session in &self.sessions {
             session.validate()?;
@@ -189,6 +235,23 @@ impl RuntimeState {
             }
         }
 
+        for delivery in &self.outbound_deliveries {
+            delivery.validate()?;
+
+            if !outbound_delivery_ids.insert(delivery.id()) {
+                return Err(format!("duplicate outbound delivery id {}", delivery.id()));
+            }
+
+            self.validate_outbound_delivery_session(delivery)?;
+
+            if self.updated_at_unix < delivery.updated_at_unix() {
+                return Err(format!(
+                    "runtime state updated_at_unix before outbound delivery {} updated_at_unix",
+                    delivery.id()
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -196,6 +259,7 @@ impl RuntimeState {
         sessions: Vec<Session>,
         runs: Vec<RunRecord>,
         inbound_events: Vec<InboundEventRecord>,
+        outbound_deliveries: Vec<OutboundDeliveryRecord>,
         updated_at_unix: u64,
         normalize_aggregate_updated_at: bool,
     ) -> Result<Self, String> {
@@ -203,6 +267,7 @@ impl RuntimeState {
             sessions,
             runs,
             inbound_events,
+            outbound_deliveries,
             updated_at_unix,
         };
         if normalize_aggregate_updated_at {
@@ -218,6 +283,21 @@ impl RuntimeState {
                 "run {} references unknown session {}",
                 run.id(),
                 run.session_id()
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_outbound_delivery_session(
+        &self,
+        delivery: &OutboundDeliveryRecord,
+    ) -> Result<(), String> {
+        if self.session(delivery.session_id()).is_none() {
+            return Err(format!(
+                "outbound delivery {} references unknown session {}",
+                delivery.id(),
+                delivery.session_id()
             ));
         }
 
@@ -262,6 +342,11 @@ impl RuntimeState {
                     .iter()
                     .map(InboundEventRecord::recorded_at_unix),
             )
+            .chain(
+                self.outbound_deliveries
+                    .iter()
+                    .map(OutboundDeliveryRecord::updated_at_unix),
+            )
             .fold(self.updated_at_unix, u64::max);
         self.updated_at_unix = updated_at_unix;
     }
@@ -292,6 +377,33 @@ impl RuntimeState {
 
         Ok(())
     }
+
+    pub(super) fn preserve_outbound_deliveries_from(
+        &mut self,
+        existing: &RuntimeState,
+    ) -> Result<(), String> {
+        for existing_delivery in &existing.outbound_deliveries {
+            match self
+                .outbound_deliveries
+                .iter()
+                .find(|delivery| delivery.id() == existing_delivery.id())
+            {
+                Some(candidate_delivery) if candidate_delivery == existing_delivery => {}
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting outbound delivery {}",
+                        existing_delivery.id()
+                    ));
+                }
+                None => {
+                    self.touch_at(existing_delivery.updated_at_unix());
+                    self.outbound_deliveries.push(existing_delivery.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for RuntimeState {
@@ -311,6 +423,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
             sessions: Vec<Session>,
             runs: Vec<RunRecord>,
             inbound_events: Vec<InboundEventRecord>,
+            outbound_deliveries: Vec<OutboundDeliveryRecord>,
             updated_at_unix: u64,
         }
 
@@ -319,6 +432,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
             sessions: wire.sessions,
             runs: wire.runs,
             inbound_events: wire.inbound_events,
+            outbound_deliveries: wire.outbound_deliveries,
             updated_at_unix: wire.updated_at_unix,
         };
         state.validate().map_err(de::Error::custom)?;
@@ -338,9 +452,10 @@ mod tests {
     use super::RuntimeState;
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
-        message::Message,
+        message::{Message, MessageAuthor, MessageContent, MessageId},
+        outbox::{OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord},
         run::{RunId, RunRecord, RunStatus},
-        session::{Session, SessionScope},
+        session::{Session, SessionId, SessionScope},
     };
 
     const FUTURE_UNIX: u64 = 4_102_444_800;
@@ -353,6 +468,7 @@ mod tests {
         assert!(encoded.get("sessions").is_some());
         assert!(encoded.get("runs").is_some());
         assert!(encoded.get("inbound_events").is_some());
+        assert!(encoded.get("outbound_deliveries").is_some());
         assert!(encoded.get("updated_at_unix").is_some());
     }
     #[test]
@@ -363,6 +479,7 @@ mod tests {
             "sessions": [],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }"#,
         )
@@ -394,6 +511,74 @@ mod tests {
         );
         assert_eq!(state.inbound_events().len(), 1);
         assert_eq!(state.updated_at_unix(), 20);
+    }
+    #[test]
+    fn state_enqueues_outbound_deliveries_idempotently() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let session_id = session.id().clone();
+        let delivery = outbound_delivery_fixture("out_1", session_id.clone(), 12);
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state.updated_at_unix = FUTURE_UNIX;
+        let updated_before_enqueue = state.updated_at_unix();
+
+        assert_eq!(
+            state
+                .enqueue_outbound_delivery(delivery.clone())
+                .expect("delivery should enqueue"),
+            OutboundDeliveryEnqueueStatus::Queued
+        );
+        assert!(state.outbound_delivery(delivery.id()).is_some());
+        assert_eq!(state.outbound_deliveries().len(), 1);
+        assert_eq!(state.updated_at_unix(), updated_before_enqueue);
+
+        assert_eq!(
+            state
+                .enqueue_outbound_delivery(delivery.clone())
+                .expect("duplicate delivery should not fail"),
+            OutboundDeliveryEnqueueStatus::Duplicate
+        );
+        assert_eq!(state.outbound_deliveries().len(), 1);
+        assert_eq!(state.updated_at_unix(), updated_before_enqueue);
+
+        let conflicting = outbound_delivery_fixture("out_1", session_id, 13);
+        let err = state
+            .enqueue_outbound_delivery(conflicting)
+            .expect_err("same id with different payload should fail closed");
+        assert!(err.contains("conflicting outbound delivery"));
+    }
+    #[test]
+    fn state_rejects_outbound_delivery_without_known_session() {
+        let scope = SessionScope::new("lark", "chat:oc_missing").expect("valid scope");
+        let delivery = outbound_delivery_fixture("out_missing", SessionId::for_scope(&scope), 12);
+        let mut state = RuntimeState::new();
+
+        let err = state
+            .enqueue_outbound_delivery(delivery)
+            .expect_err("delivery without a known session should fail");
+
+        assert!(err.contains("references unknown session"));
+        assert!(state.outbound_deliveries().is_empty());
+    }
+    #[test]
+    fn state_rejects_non_pending_outbound_delivery_enqueue() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let session_id = session.id().clone();
+        let mut delivery = outbound_delivery_fixture("out_1", session_id, 12);
+        delivery
+            .begin_delivery(13)
+            .expect("delivery can enter delivering state");
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+
+        let err = state
+            .enqueue_outbound_delivery(delivery)
+            .expect_err("enqueue should only accept pending deliveries");
+
+        assert!(err.contains("cannot enqueue from Delivering"));
+        assert!(state.outbound_deliveries().is_empty());
     }
     #[test]
     fn state_transitions_persisted_run_records() {
@@ -483,6 +668,22 @@ mod tests {
         state.validate().expect("state should remain valid");
     }
     #[test]
+    fn add_outbound_delivery_advances_state_updated_at_to_delivery_record() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let session_id = session.id().clone();
+        let delivery = outbound_delivery_fixture("out_future", session_id, FUTURE_UNIX);
+        let mut state = RuntimeState::new();
+
+        state.upsert_session(session);
+        state
+            .enqueue_outbound_delivery(delivery)
+            .expect("delivery should be accepted");
+
+        assert!(state.updated_at_unix() >= FUTURE_UNIX);
+        state.validate().expect("state should remain valid");
+    }
+    #[test]
     fn upsert_session_advances_state_updated_at_to_inserted_session() {
         let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
         let session = session_fixture(&scope, 10, FUTURE_UNIX);
@@ -552,6 +753,28 @@ mod tests {
             EventKind::MessageReceived { message },
             received_at_unix,
         )
+    }
+
+    fn outbound_delivery_fixture(
+        id: &str,
+        session_id: SessionId,
+        created_at_unix: u64,
+    ) -> OutboundDeliveryRecord {
+        let message = Message::new(
+            MessageId::new(format!("msg_{id}")).expect("valid message id"),
+            Some(session_id.clone()),
+            MessageAuthor::Agent,
+            MessageContent::text("hello").expect("valid text"),
+            created_at_unix,
+        );
+
+        OutboundDeliveryRecord::new(
+            OutboundDeliveryId::new(id).expect("valid outbound id"),
+            session_id,
+            message,
+            created_at_unix,
+        )
+        .expect("valid outbound delivery")
     }
 
     fn state_with_pending_run(run_id: &str) -> (RuntimeState, RunId) {

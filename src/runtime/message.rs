@@ -81,7 +81,7 @@ impl<'de> Deserialize<'de> for MessageContent {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
         enum MessageContentWire {
             Text { text: String },
             Markdown { markdown: String },
@@ -132,6 +132,7 @@ impl MessageContent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Message {
     pub id: MessageId,
     pub session_id: Option<SessionId>,
@@ -208,6 +209,40 @@ mod tests {
             err.to_string()
                 .contains("message markdown must not be empty")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_message_fields_from_json() {
+        let err = serde_json::from_str::<Message>(
+            r#"{
+            "id": "msg_1",
+            "session_id": null,
+            "author": "agent",
+            "content": {"type": "text", "text": "hello"},
+            "created_at_unix": 1,
+            "future_field": true
+        }"#,
+        )
+        .expect_err("unknown message fields must not be dropped");
+
+        assert!(err.to_string().contains("unknown field `future_field`"));
+    }
+
+    #[test]
+    fn rejects_unknown_message_content_fields_from_json() {
+        let err = serde_json::from_str::<MessageContent>(
+            r#"{"type":"text","text":"hello","future_field":true}"#,
+        )
+        .expect_err("unknown text content fields must not be dropped");
+
+        assert!(err.to_string().contains("unknown field `future_field`"));
+
+        let err = serde_json::from_str::<MessageContent>(
+            r#"{"type":"markdown","markdown":"**hello**","future_field":true}"#,
+        )
+        .expect_err("unknown markdown content fields must not be dropped");
+
+        assert!(err.to_string().contains("unknown field `future_field`"));
     }
 
     #[test]
