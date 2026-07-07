@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{read_json, write_json_atomic};
+use super::persistence::{read_json, write_json_atomic};
 
 pub const CONFIG_VERSION: u32 = 1;
 

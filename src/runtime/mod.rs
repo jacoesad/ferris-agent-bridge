@@ -4,6 +4,7 @@ pub mod event;
 pub mod logging;
 pub mod message;
 pub mod orchestrator;
+mod persistence;
 pub mod run;
 pub mod session;
 pub mod state;
