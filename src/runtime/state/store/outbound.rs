@@ -199,6 +199,46 @@ mod tests {
         );
     }
     #[test]
+    fn state_store_stale_save_fails_closed_on_conflicting_outbound_delivery() {
+        let path =
+            test_path("state-stale-save-conflicting-outbound-delivery").join("runtime.state.json");
+        let stale_writer = StateStore::new(&path);
+        let enqueue_writer = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let session_id = session.id().clone();
+        let delivery = outbound_delivery_fixture("out_1", session_id.clone(), 10);
+        let conflicting_delivery = outbound_delivery_fixture("out_1", session_id, 11);
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+        stale_writer
+            .save(&initial)
+            .expect("initial state should save");
+        let mut stale_snapshot = stale_writer.load().expect("state should load");
+        assert_eq!(
+            stale_snapshot
+                .enqueue_outbound_delivery(conflicting_delivery.clone())
+                .expect("conflicting stale delivery should enqueue in the stale snapshot"),
+            OutboundDeliveryEnqueueStatus::Queued
+        );
+
+        let status = enqueue_writer
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("current delivery should persist before send");
+        assert_eq!(status, OutboundDeliveryEnqueueStatus::Queued);
+
+        let err = stale_writer
+            .save(&stale_snapshot)
+            .expect_err("stale save with a conflicting outbound delivery should fail closed");
+
+        assert!(err.contains("conflicting outbound delivery out_1"));
+        let loaded = StateStore::new(&path).load().expect("state should load");
+        assert_eq!(loaded.outbound_delivery(delivery.id()), Some(&delivery));
+        assert_ne!(
+            loaded.outbound_delivery(delivery.id()),
+            Some(&conflicting_delivery)
+        );
+    }
+    #[test]
     fn state_store_stale_save_fails_closed_when_outbound_session_is_missing() {
         let path =
             test_path("state-stale-save-missing-outbound-session").join("runtime.state.json");
