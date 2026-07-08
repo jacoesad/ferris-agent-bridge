@@ -95,7 +95,8 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - 用于重复投递处理的 durable inbound event ledger（#9）
 - Inbound events 的 store-level ack-after-persist persistence primitive（#11）
 - 通过初始 `ImAdapter` 和 runtime orchestrator intake 边界接入显式 transport acknowledgement
-- 用于可靠回复投递的 durable outbound outbox
+- Durable outbound outbox records，以及 send 前必须 enqueue 的 persistence primitive
+- Outbox consumption、retry，以及具体 outbound adapter handoff
 - Per-scope message queue，包含 debounce 和 batching
 - Scope 级互斥：同一个 scope 同时最多一个 active run
 - Startup recovery，将 pending、running 和 failed runs 恢复为显式状态

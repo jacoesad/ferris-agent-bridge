@@ -1,20 +1,29 @@
-use std::fmt;
+use serde::{Deserialize, Serialize};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use crate::runtime::{
+    event::InboundEventRecord, outbox::OutboundDeliveryRecord, run::RunRecord, session::Session,
+};
 
-use crate::runtime::{event::InboundEventRecord, run::RunRecord, session::Session};
+use super::{
+    super::model::RuntimeState,
+    versioned,
+    wire::{WireField, deserialize_wire_field},
+};
 
-use super::model::RuntimeState;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 4;
+pub(super) const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
+pub(super) const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
+pub(super) const RUNTIME_STATE_FILE_V3_VERSION: u32 = 3;
 
-pub const RUNTIME_STATE_FILE_VERSION: u32 = 3;
-const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
-const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
-
-pub(super) fn state_file_from_state(state: &RuntimeState) -> impl Serialize + '_ {
+pub(in crate::runtime::state) fn state_file_from_state(
+    state: &RuntimeState,
+) -> impl Serialize + '_ {
     RuntimeStateFile::from_state(state)
 }
 
-pub(super) fn parse_state_file(input: &str) -> Result<RuntimeState, serde_json::Error> {
+pub(in crate::runtime::state) fn parse_state_file(
+    input: &str,
+) -> Result<RuntimeState, serde_json::Error> {
     let state_file: RuntimeStateFileWire = serde_json::from_str(input)?;
     state_file
         .into_state()
@@ -27,6 +36,7 @@ struct RuntimeStateFile<'a> {
     sessions: &'a [Session],
     runs: &'a [RunRecord],
     inbound_events: &'a [InboundEventRecord],
+    outbound_deliveries: &'a [OutboundDeliveryRecord],
     updated_at_unix: u64,
 }
 
@@ -37,6 +47,7 @@ impl<'a> RuntimeStateFile<'a> {
             sessions: state.sessions(),
             runs: state.runs(),
             inbound_events: state.inbound_events(),
+            outbound_deliveries: state.outbound_deliveries(),
             updated_at_unix: state.updated_at_unix(),
         }
     }
@@ -51,101 +62,30 @@ struct RuntimeStateFileWire {
     runs: WireField<Vec<RunRecord>>,
     #[serde(default, deserialize_with = "deserialize_wire_field")]
     inbound_events: WireField<Vec<InboundEventRecord>>,
+    #[serde(default, deserialize_with = "deserialize_wire_field")]
+    outbound_deliveries: WireField<Vec<OutboundDeliveryRecord>>,
     updated_at_unix: u64,
 }
 
 impl RuntimeStateFileWire {
     fn into_state(self) -> Result<RuntimeState, String> {
-        let (runs, inbound_events, normalize_aggregate_updated_at) = match self.version {
-            RUNTIME_STATE_FILE_V1_VERSION => {
-                if self.runs.is_present() {
-                    return Err("runtime state version 1 must not contain run records".to_string());
-                }
-
-                if self.inbound_events.is_present() {
-                    return Err(
-                        "runtime state version 1 must not contain inbound event records"
-                            .to_string(),
-                    );
-                }
-
-                (Vec::new(), Vec::new(), true)
-            }
-            RUNTIME_STATE_FILE_V2_VERSION => {
-                let runs = self
-                    .runs
-                    .into_required("runtime state version 2 must contain run records")?;
-
-                if self.inbound_events.is_present() {
-                    return Err(
-                        "runtime state version 2 must not contain inbound event records"
-                            .to_string(),
-                    );
-                }
-
-                (runs, Vec::new(), true)
-            }
-            RUNTIME_STATE_FILE_VERSION => {
-                let runs = self.runs.into_required(format!(
-                    "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain run records"
-                ))?;
-                let inbound_events = self.inbound_events.into_required(format!(
-                    "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain inbound event records"
-                ))?;
-
-                (runs, inbound_events, false)
-            }
-            version => {
-                return Err(format!(
-                    "unsupported runtime state version {}; expected {}",
-                    version, RUNTIME_STATE_FILE_VERSION
-                ));
-            }
-        };
+        let collections = versioned::decode_persisted_collections(
+            self.version,
+            self.runs,
+            self.inbound_events,
+            self.outbound_deliveries,
+        )?;
         RuntimeState::from_persisted_parts(
             self.sessions,
-            runs,
-            inbound_events,
+            collections.runs,
+            collections.inbound_events,
+            collections.outbound_deliveries,
             self.updated_at_unix,
-            normalize_aggregate_updated_at,
+            collections.normalize_aggregate_updated_at,
         )
     }
 }
 
-#[derive(Default)]
-enum WireField<T> {
-    #[default]
-    Missing,
-    Null,
-    Value(T),
-}
-
-impl<T> WireField<T> {
-    fn is_present(&self) -> bool {
-        !matches!(self, Self::Missing)
-    }
-
-    fn into_required<M>(self, message: M) -> Result<T, String>
-    where
-        M: fmt::Display,
-    {
-        match self {
-            Self::Value(value) => Ok(value),
-            Self::Missing | Self::Null => Err(message.to_string()),
-        }
-    }
-}
-
-fn deserialize_wire_field<'de, D, T>(deserializer: D) -> Result<WireField<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(match Option::<T>::deserialize(deserializer)? {
-        Some(value) => WireField::Value(value),
-        None => WireField::Null,
-    })
-}
 #[cfg(test)]
 mod tests {
     use std::{
@@ -155,9 +95,10 @@ mod tests {
 
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecord},
-        message::Message,
+        message::{Message, MessageAuthor, MessageContent, MessageId},
+        outbox::{OutboundDeliveryId, OutboundDeliveryRecord},
         run::{RunId, RunRecord},
-        session::{Session, SessionScope},
+        session::{Session, SessionId, SessionScope},
         state::{RuntimeState, StateStore},
     };
 
@@ -182,305 +123,7 @@ mod tests {
         assert!(encoded.get("runs").is_some());
         assert!(encoded.get("updated_at_unix").is_some());
         assert!(encoded.get("inbound_events").is_some());
-    }
-    #[test]
-    fn state_load_migrates_released_version_1_without_runs_or_inbound_event_records() {
-        let path = test_path("state-v1-released-shape").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 1,
-            "sessions": [],
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let state = store
-            .load()
-            .expect("released version 1 state should migrate");
-
-        assert!(state.runs().is_empty());
-        assert!(state.inbound_events().is_empty());
-    }
-    #[test]
-    fn state_load_migrates_version_1_stale_aggregate_updated_at() {
-        let path = test_path("state-v1-stale-aggregate-updated-at").join("runtime.state.json");
-        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
-        let session = session_fixture(&scope, 10, 20);
-        let encoded = format!(
-            r#"{{
-            "version": 1,
-            "sessions": [{session}],
-            "updated_at_unix": 1
-        }}"#,
-            session = serde_json::to_string(&session).expect("session should encode")
-        );
-        fs::write(&path, encoded).expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let state = store
-            .load()
-            .expect("version 1 state should normalize aggregate timestamps while migrating");
-
-        assert_eq!(state.updated_at_unix(), 20);
-        assert!(state.runs().is_empty());
-        assert!(state.inbound_events().is_empty());
-    }
-    #[test]
-    fn state_load_rejects_version_1_with_run_records() {
-        let path = test_path("state-v1-with-runs").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 1,
-            "sessions": [],
-            "runs": [],
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 1 state must not carry run records");
-
-        assert!(err.contains("version 1 must not contain run records"));
-    }
-    #[test]
-    fn state_load_rejects_version_1_with_null_run_records() {
-        let path = test_path("state-v1-with-null-runs").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 1,
-            "sessions": [],
-            "runs": null,
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 1 state must reject present null runs");
-
-        assert!(err.contains("version 1 must not contain run records"));
-    }
-    #[test]
-    fn state_load_rejects_version_1_with_inbound_event_records() {
-        let path = test_path("state-v1-with-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 1,
-            "sessions": [],
-            "inbound_events": [],
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 1 state must not carry inbound event records");
-
-        assert!(err.contains("version 1 must not contain inbound event records"));
-    }
-    #[test]
-    fn state_load_migrates_version_2_without_inbound_event_records() {
-        let path = test_path("state-v2-without-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 2,
-            "sessions": [],
-            "runs": [],
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let state = store
-            .load()
-            .expect("version 2 state without inbound event records should migrate");
-
-        assert!(state.runs().is_empty());
-        assert!(state.inbound_events().is_empty());
-    }
-    #[test]
-    fn state_load_migrates_version_2_stale_aggregate_updated_at() {
-        let path = test_path("state-v2-stale-aggregate-updated-at").join("runtime.state.json");
-        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
-        let session = session_fixture(&scope, 1, 2);
-        let run = RunRecord::new(
-            RunId::new("run_1").expect("valid run id"),
-            session.id().clone(),
-            20,
-        );
-        let encoded = format!(
-            r#"{{
-            "version": 2,
-            "sessions": [{session}],
-            "runs": [{run}],
-            "updated_at_unix": 1
-        }}"#,
-            session = serde_json::to_string(&session).expect("session should encode"),
-            run = serde_json::to_string(&run).expect("run should encode")
-        );
-        fs::write(&path, encoded).expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let state = store
-            .load()
-            .expect("version 2 state should normalize aggregate timestamps while migrating");
-
-        assert_eq!(state.updated_at_unix(), 20);
-        assert_eq!(state.runs().len(), 1);
-        assert!(state.inbound_events().is_empty());
-    }
-    #[test]
-    fn state_load_rejects_version_2_with_inbound_event_records() {
-        let path = test_path("state-v2-with-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 2,
-            "sessions": [],
-            "runs": [],
-            "inbound_events": [],
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 2 state must not carry inbound event records");
-
-        assert!(err.contains("version 2 must not contain inbound event records"));
-    }
-    #[test]
-    fn state_load_rejects_version_2_with_null_inbound_event_records() {
-        let path = test_path("state-v2-with-null-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 2,
-            "sessions": [],
-            "runs": [],
-            "inbound_events": null,
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("version 2 state must reject present null inbound event records");
-
-        assert!(err.contains("version 2 must not contain inbound event records"));
-    }
-    #[test]
-    fn state_load_rejects_future_file_version() {
-        let path = test_path("state-future-version").join("runtime.state.json");
-        fs::write(
-            &path,
-            r#"{
-            "version": 4,
-            "sessions": [],
-            "runs": [],
-            "inbound_events": [],
-            "updated_at_unix": 1
-        }"#,
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("future state versions must not be loaded");
-
-        assert!(err.contains("unsupported runtime state version 4; expected 3"));
-    }
-    #[test]
-    fn state_load_rejects_current_version_without_run_records() {
-        let path = test_path("state-v3-without-runs").join("runtime.state.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{
-                "version": {},
-                "sessions": [],
-                "updated_at_unix": 1
-            }}"#,
-                super::RUNTIME_STATE_FILE_VERSION
-            ),
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("current state version must carry run records");
-
-        assert!(err.contains("must contain run records"));
-    }
-    #[test]
-    fn state_load_rejects_current_version_without_inbound_event_records() {
-        let path = test_path("state-v3-without-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{
-                "version": {},
-                "sessions": [],
-                "runs": [],
-                "updated_at_unix": 1
-            }}"#,
-                super::RUNTIME_STATE_FILE_VERSION
-            ),
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("current state version must carry inbound events");
-
-        assert!(err.contains("must contain inbound event records"));
-    }
-    #[test]
-    fn state_load_rejects_current_version_with_null_inbound_event_records() {
-        let path = test_path("state-v3-with-null-inbound-events").join("runtime.state.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{
-                "version": {},
-                "sessions": [],
-                "runs": [],
-                "inbound_events": null,
-                "updated_at_unix": 1
-            }}"#,
-                super::RUNTIME_STATE_FILE_VERSION
-            ),
-        )
-        .expect("state fixture should write");
-        let store = StateStore::new(path);
-
-        let err = store
-            .load()
-            .expect_err("current state version must reject null inbound events");
-
-        assert!(err.contains("must contain inbound event records"));
+        assert!(encoded.get("outbound_deliveries").is_some());
     }
     #[test]
     fn state_load_rejects_stale_state_updated_at_for_sessions() {
@@ -493,6 +136,7 @@ mod tests {
             "sessions": [{session}],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -523,6 +167,7 @@ mod tests {
             "sessions": [{session}],
             "runs": [{run}],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -549,6 +194,7 @@ mod tests {
             "sessions": [],
             "runs": [],
             "inbound_events": [{record}],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -564,6 +210,34 @@ mod tests {
         assert!(err.contains("before inbound event"));
     }
     #[test]
+    fn state_load_rejects_stale_state_updated_at_for_outbound_deliveries() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 1);
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 12);
+        let path = test_path("state-stale-updated-at-outbound-delivery").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+            "version": {version},
+            "sessions": [{session}],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [{delivery}],
+            "updated_at_unix": 1
+        }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            delivery = serde_json::to_string(&delivery).expect("delivery should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("state updated_at should not lag outbound delivery records");
+
+        assert!(err.contains("before outbound delivery"));
+    }
+    #[test]
     fn state_load_rejects_unknown_file_fields() {
         let path = test_path("state-unknown-file-fields").join("runtime.state.json");
         fs::write(
@@ -574,6 +248,7 @@ mod tests {
                 "sessions": [],
                 "runs": [],
                 "inbound_events": [],
+                "outbound_deliveries": [],
                 "future_field": [],
                 "updated_at_unix": 1
             }}"#,
@@ -606,6 +281,7 @@ mod tests {
             }}],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
                 super::RUNTIME_STATE_FILE_VERSION
@@ -640,6 +316,7 @@ mod tests {
             }}],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
                 super::RUNTIME_STATE_FILE_VERSION
@@ -676,6 +353,7 @@ mod tests {
                 "future_field": true
             }}],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -705,6 +383,7 @@ mod tests {
                 "recorded_at_unix": 12,
                 "future_field": true
             }}],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
             super::RUNTIME_STATE_FILE_VERSION
@@ -715,6 +394,101 @@ mod tests {
         let err = store
             .load()
             .expect_err("unknown inbound event fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+    #[test]
+    fn state_load_rejects_unknown_outbound_delivery_fields() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 1);
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 12);
+        let mut delivery_json =
+            serde_json::to_value(&delivery).expect("delivery should encode as json");
+        delivery_json["future_field"] = serde_json::Value::Bool(true);
+        let path = test_path("state-unknown-outbound-delivery-fields").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+            "version": {version},
+            "sessions": [{session}],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [{delivery}],
+            "updated_at_unix": 12
+        }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            delivery = serde_json::to_string(&delivery_json).expect("delivery should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown outbound delivery fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+    #[test]
+    fn state_load_rejects_unknown_outbound_delivery_message_fields() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 1);
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 12);
+        let mut delivery_json =
+            serde_json::to_value(&delivery).expect("delivery should encode as json");
+        delivery_json["message"]["future_field"] = serde_json::Value::Bool(true);
+        let path =
+            test_path("state-unknown-outbound-delivery-message-fields").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+            "version": {version},
+            "sessions": [{session}],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [{delivery}],
+            "updated_at_unix": 12
+        }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            delivery = serde_json::to_string(&delivery_json).expect("delivery should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown nested message fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+    #[test]
+    fn state_load_rejects_unknown_outbound_delivery_message_content_fields() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 1);
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 12);
+        let mut delivery_json =
+            serde_json::to_value(&delivery).expect("delivery should encode as json");
+        delivery_json["message"]["content"]["future_field"] = serde_json::Value::Bool(true);
+        let path = test_path("state-unknown-outbound-delivery-message-content-fields")
+            .join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+            "version": {version},
+            "sessions": [{session}],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [{delivery}],
+            "updated_at_unix": 12
+        }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            delivery = serde_json::to_string(&delivery_json).expect("delivery should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("unknown nested message content fields must not be dropped");
 
         assert!(err.contains("unknown field `future_field`"));
     }
@@ -730,6 +504,7 @@ mod tests {
             "sessions": [{session}, {session}],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": {updated_at_unix}
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -758,6 +533,7 @@ mod tests {
             "sessions": [{session}],
             "runs": [{run}, {run}],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": {updated_at_unix}
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -786,6 +562,7 @@ mod tests {
             "sessions": [],
             "runs": [{run}],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": {updated_at_unix}
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -812,6 +589,7 @@ mod tests {
             "sessions": [],
             "runs": [],
             "inbound_events": [{record}, {record}],
+            "outbound_deliveries": [],
             "updated_at_unix": {updated_at_unix}
         }}"#,
             version = super::RUNTIME_STATE_FILE_VERSION,
@@ -825,6 +603,61 @@ mod tests {
             .expect_err("duplicate inbound event ids should be rejected");
 
         assert!(err.contains("duplicate inbound event id"));
+    }
+    #[test]
+    fn state_validation_rejects_duplicate_outbound_delivery_ids() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 1, 1);
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 12);
+        let path = test_path("state-duplicate-outbound-delivery-ids").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+            "version": {version},
+            "sessions": [{session}],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [{delivery}, {delivery}],
+            "updated_at_unix": 12
+        }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            session = serde_json::to_string(&session).expect("session should encode"),
+            delivery = serde_json::to_string(&delivery).expect("delivery should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("duplicate outbound delivery ids should be rejected");
+
+        assert!(err.contains("duplicate outbound delivery id"));
+    }
+    #[test]
+    fn state_validation_rejects_outbound_delivery_without_session() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session_id = SessionId::for_scope(&scope);
+        let delivery = outbound_delivery_fixture("out_1", session_id, 12);
+        let path = test_path("state-outbound-delivery-without-session").join("runtime.state.json");
+        let encoded = format!(
+            r#"{{
+            "version": {version},
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [{delivery}],
+            "updated_at_unix": 12
+        }}"#,
+            version = super::RUNTIME_STATE_FILE_VERSION,
+            delivery = serde_json::to_string(&delivery).expect("delivery should encode")
+        );
+        fs::write(&path, encoded).expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("outbound delivery without known session should be rejected");
+
+        assert!(err.contains("references unknown session"));
     }
     #[test]
     fn state_load_rejects_session_id_scope_mismatch() {
@@ -842,6 +675,7 @@ mod tests {
             }}],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
                 super::RUNTIME_STATE_FILE_VERSION
@@ -872,6 +706,7 @@ mod tests {
             }}],
             "runs": [],
             "inbound_events": [],
+            "outbound_deliveries": [],
             "updated_at_unix": 1
         }}"#,
                 super::RUNTIME_STATE_FILE_VERSION
@@ -886,7 +721,6 @@ mod tests {
 
         assert!(err.contains("updated_at_unix before created_at_unix"));
     }
-
     fn test_path(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "ferris-agent-bridge-{name}-{}-{}",
@@ -896,7 +730,6 @@ mod tests {
         fs::create_dir_all(&path).expect("test dir should exist");
         path
     }
-
     fn session_fixture(
         scope: &SessionScope,
         created_at_unix: u64,
@@ -915,7 +748,6 @@ mod tests {
         ))
         .expect("session fixture should decode")
     }
-
     fn event_fixture(id: &str, received_at_unix: u64) -> Event {
         let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
         Event::new(
@@ -925,11 +757,31 @@ mod tests {
             received_at_unix,
         )
     }
-
     fn state_event_record(
         event: &Event,
         recorded_at_unix: u64,
     ) -> Result<InboundEventRecord, String> {
         InboundEventRecord::from_event(event, recorded_at_unix)
+    }
+    fn outbound_delivery_fixture(
+        id: &str,
+        session_id: SessionId,
+        created_at_unix: u64,
+    ) -> OutboundDeliveryRecord {
+        let message = Message::new(
+            MessageId::new(format!("msg_{id}")).expect("valid message id"),
+            Some(session_id.clone()),
+            MessageAuthor::Agent,
+            MessageContent::text("hello").expect("valid text"),
+            created_at_unix,
+        );
+
+        OutboundDeliveryRecord::new(
+            OutboundDeliveryId::new(id).expect("valid outbound id"),
+            session_id,
+            message,
+            created_at_unix,
+        )
+        .expect("valid outbound delivery")
     }
 }
