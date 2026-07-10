@@ -89,6 +89,7 @@ mod tests {
     use crate::{
         adapter::{
             ImAdapter, InboundDelivery, InboundDeliveryAckToken, InboundDeliveryAcknowledgement,
+            OutboundDeliveryFailure,
         },
         runtime::{
             error::ErrorClass,
@@ -241,8 +242,8 @@ mod tests {
         fn deliver_outbound_message(
             &mut self,
             _attempt: &OutboundDeliveryAttempt,
-        ) -> Result<(), String> {
-            Err("outbound delivery is not used by inbound orchestrator tests".to_owned())
+        ) -> Result<(), OutboundDeliveryFailure> {
+            Ok(())
         }
     }
 

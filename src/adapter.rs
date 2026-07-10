@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{error::Error, fmt};
 
 use crate::runtime::{
     event::{Event, EventId, InboundEventRecordStatus},
@@ -61,6 +61,64 @@ pub struct InboundDeliveryAcknowledgement {
     record_status: InboundEventRecordStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDeliveryFailureKind {
+    Retryable,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundDeliveryFailure {
+    kind: OutboundDeliveryFailureKind,
+    message: String,
+}
+
+impl OutboundDeliveryFailure {
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self::new(OutboundDeliveryFailureKind::Retryable, message)
+    }
+
+    pub fn uncertain(message: impl Into<String>) -> Self {
+        Self::new(OutboundDeliveryFailureKind::Uncertain, message)
+    }
+
+    pub fn kind(&self) -> OutboundDeliveryFailureKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn new(kind: OutboundDeliveryFailureKind, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let message = if message.trim().is_empty() {
+            match kind {
+                OutboundDeliveryFailureKind::Retryable => {
+                    "outbound adapter reported a retryable failure without an error message"
+                        .to_owned()
+                }
+                OutboundDeliveryFailureKind::Uncertain => {
+                    "outbound adapter reported an uncertain outcome without an error message"
+                        .to_owned()
+                }
+            }
+        } else {
+            message
+        };
+
+        Self { kind, message }
+    }
+}
+
+impl fmt::Display for OutboundDeliveryFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+impl Error for OutboundDeliveryFailure {}
+
 impl InboundDeliveryAcknowledgement {
     pub(crate) fn new(
         event_id: EventId,
@@ -93,15 +151,17 @@ pub trait ImAdapter {
         acknowledgement: &InboundDeliveryAcknowledgement,
     ) -> Result<(), String>;
 
-    fn deliver_outbound_message(&mut self, attempt: &OutboundDeliveryAttempt)
-    -> Result<(), String>;
+    fn deliver_outbound_message(
+        &mut self,
+        attempt: &OutboundDeliveryAttempt,
+    ) -> Result<(), OutboundDeliveryFailure>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         InboundDelivery, InboundDeliveryAckToken, InboundDeliveryAcknowledgement,
-        InboundEventRecordStatus,
+        InboundEventRecordStatus, OutboundDeliveryFailure, OutboundDeliveryFailureKind,
     };
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource},
@@ -147,6 +207,26 @@ mod tests {
             acknowledgement.record_status(),
             InboundEventRecordStatus::Duplicate
         );
+    }
+
+    #[test]
+    fn outbound_delivery_failures_preserve_retry_safety_classification() {
+        let retryable = OutboundDeliveryFailure::retryable("provider rejected the request");
+        assert_eq!(retryable.kind(), OutboundDeliveryFailureKind::Retryable);
+        assert_eq!(retryable.message(), "provider rejected the request");
+
+        let uncertain = OutboundDeliveryFailure::uncertain("provider response timed out");
+        assert_eq!(uncertain.kind(), OutboundDeliveryFailureKind::Uncertain);
+        assert_eq!(uncertain.message(), "provider response timed out");
+    }
+
+    #[test]
+    fn outbound_delivery_failures_normalize_empty_messages() {
+        let retryable = OutboundDeliveryFailure::retryable("  ");
+        assert!(retryable.message().contains("retryable failure"));
+
+        let uncertain = OutboundDeliveryFailure::uncertain("");
+        assert!(uncertain.message().contains("uncertain outcome"));
     }
 
     fn event_fixture(id: &str) -> Event {

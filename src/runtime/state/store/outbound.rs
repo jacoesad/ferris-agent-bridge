@@ -90,6 +90,19 @@ impl StateStore {
         self.write_unlocked(&state)?;
         Ok(delivery)
     }
+
+    pub fn mark_outbound_delivery_uncertain(
+        &self,
+        id: &OutboundDeliveryId,
+        uncertain_at_unix: u64,
+        error: impl Into<String>,
+    ) -> Result<OutboundDeliveryRecord, String> {
+        let _guard = self.lock_write()?;
+        let mut state = self.load()?;
+        let delivery = state.mark_outbound_delivery_uncertain(id, uncertain_at_unix, error)?;
+        self.write_unlocked(&state)?;
+        Ok(delivery)
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +307,40 @@ mod tests {
         );
     }
     #[test]
+    fn state_store_marks_uncertain_outbound_delivery_before_returning() {
+        let path = test_path("state-outbound-delivery-uncertain").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 10);
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+        store.save(&initial).expect("initial state should save");
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        store
+            .claim_next_outbound_delivery(11)
+            .expect("delivery should claim");
+
+        let uncertain = store
+            .mark_outbound_delivery_uncertain(delivery.id(), 12, "provider acceptance is unknown")
+            .expect("uncertain outcome should persist");
+
+        assert_eq!(uncertain.status(), OutboundDeliveryStatus::Uncertain);
+        assert_eq!(
+            uncertain.last_error(),
+            Some("provider acceptance is unknown")
+        );
+        let loaded = store.load().expect("state should load");
+        assert_eq!(
+            loaded
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Uncertain
+        );
+    }
+    #[test]
     fn state_store_serializes_outbound_claims_across_same_path_handles() {
         let path = test_path("state-outbound-delivery-concurrent-claim").join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -368,7 +415,7 @@ mod tests {
     }
     #[test]
     #[cfg(unix)]
-    fn state_store_does_not_return_claim_when_outbound_claim_persist_fails() {
+    fn state_store_does_not_return_claim_on_pre_replace_persist_failure() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = test_path("state-outbound-delivery-claim-persist-failure");
@@ -401,12 +448,12 @@ mod tests {
                 .expect("delivery should remain queued")
                 .status(),
             OutboundDeliveryStatus::Pending,
-            "failed claim persistence must leave the delivery unclaimed on disk"
+            "pre-replace claim failure must leave the delivery unclaimed on disk"
         );
     }
     #[test]
     #[cfg(unix)]
-    fn state_store_does_not_return_delivered_when_outbound_delivery_persist_fails() {
+    fn state_store_does_not_return_delivered_on_pre_replace_persist_failure() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = test_path("state-outbound-delivery-delivered-persist-failure");
@@ -442,12 +489,12 @@ mod tests {
                 .expect("delivery should remain claimed")
                 .status(),
             OutboundDeliveryStatus::Delivering,
-            "failed delivered persistence must leave the disk state unchanged"
+            "pre-replace delivered failure must leave the delivery claimed"
         );
     }
     #[test]
     #[cfg(unix)]
-    fn state_store_does_not_return_failed_when_outbound_failure_persist_fails() {
+    fn state_store_does_not_return_failed_on_pre_replace_persist_failure() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = test_path("state-outbound-delivery-failed-persist-failure");
@@ -483,7 +530,50 @@ mod tests {
                 .expect("delivery should remain claimed")
                 .status(),
             OutboundDeliveryStatus::Delivering,
-            "failed failure persistence must leave the disk state unchanged"
+            "pre-replace failed-outcome failure must leave the delivery claimed"
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn state_store_does_not_return_uncertain_on_pre_replace_persist_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_path("state-outbound-delivery-uncertain-persist-failure");
+        let path = dir.join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let delivery = outbound_delivery_fixture("out_1", session.id().clone(), 10);
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+
+        store.save(&initial).expect("initial state should save");
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        store
+            .claim_next_outbound_delivery(11)
+            .expect("delivery should claim");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
+            .expect("fixture permissions should be set");
+
+        let result = store.mark_outbound_delivery_uncertain(
+            delivery.id(),
+            12,
+            "provider acceptance is unknown",
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions should be restored");
+        result.expect_err("failed uncertain persistence must not return an outcome");
+
+        let loaded = store.load().expect("state should still load");
+        assert_eq!(
+            loaded
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain claimed")
+                .status(),
+            OutboundDeliveryStatus::Delivering,
+            "pre-replace failure must leave the delivery claimed"
         );
     }
     #[test]

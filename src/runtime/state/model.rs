@@ -185,6 +185,21 @@ impl RuntimeState {
         Ok(updated_delivery)
     }
 
+    pub(super) fn mark_outbound_delivery_uncertain(
+        &mut self,
+        id: &OutboundDeliveryId,
+        uncertain_at_unix: u64,
+        error: impl Into<String>,
+    ) -> Result<OutboundDeliveryRecord, String> {
+        let updated_delivery = {
+            let delivery = self.outbound_delivery_mut(id)?;
+            delivery.mark_uncertain(uncertain_at_unix, error)?;
+            delivery.clone()
+        };
+        self.touch_at(updated_delivery.updated_at_unix().max(unix_seconds_now()));
+        Ok(updated_delivery)
+    }
+
     pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {
         {
             let run = self.run_mut(id)?;
@@ -732,6 +747,38 @@ mod tests {
             .expect("claimed delivery should fail");
         assert_eq!(failed.status(), OutboundDeliveryStatus::Failed);
         assert_eq!(failed.last_error(), Some("transport failed"));
+        state.validate().expect("state should remain valid");
+    }
+    #[test]
+    fn state_marks_uncertain_outbound_delivery_as_non_retryable() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let delivery_id = OutboundDeliveryId::new("out_uncertain").expect("valid id");
+        let delivery = outbound_delivery_fixture(delivery_id.as_str(), session.id().clone(), 12);
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state
+            .enqueue_outbound_delivery(delivery)
+            .expect("delivery should enqueue");
+        state
+            .claim_next_outbound_delivery(13)
+            .expect("delivery should claim");
+
+        let uncertain = state
+            .mark_outbound_delivery_uncertain(&delivery_id, 14, "provider acceptance is unknown")
+            .expect("uncertain outcome should persist in state");
+
+        assert_eq!(uncertain.status(), OutboundDeliveryStatus::Uncertain);
+        assert_eq!(
+            uncertain.last_error(),
+            Some("provider acceptance is unknown")
+        );
+        assert!(
+            state
+                .claim_next_outbound_delivery(u64::MAX)
+                .expect("uncertain delivery should be skipped")
+                .is_none()
+        );
         state.validate().expect("state should remain valid");
     }
     #[test]

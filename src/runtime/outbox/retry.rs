@@ -62,6 +62,7 @@ impl OutboundRetryPolicy {
             }
             OutboundDeliveryStatus::Delivering
             | OutboundDeliveryStatus::Delivered
+            | OutboundDeliveryStatus::Uncertain
             | OutboundDeliveryStatus::Failed => None,
         }
     }
