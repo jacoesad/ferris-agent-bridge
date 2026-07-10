@@ -97,7 +97,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Explicit transport acknowledgement wiring through the initial `ImAdapter` and runtime orchestrator intake boundary
 - Durable outbound outbox records and enqueue-before-send persistence primitive
 - Outbox consumption state primitives: claim queued deliveries, persist delivery attempts, and mark delivered or failed before returning control to callers
-- Outbox worker, retry scheduling/backoff, and concrete outbound adapter handoff
+- Single-step outbox worker with bounded retry scheduling/backoff and normalized outbound adapter handoff
 - Per-scope message queue with debounce and batching
 - Scope-level mutual exclusion: at most one active run per scope
 - Startup recovery for pending, running, and failed runs into explicit states

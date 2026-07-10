@@ -63,6 +63,8 @@ Event delivery should be modeled as a domain-level transport capability, not as 
 
 When a transport supports explicit delivery acknowledgement, the adapter should ask the runtime to persist or de-duplicate the normalized inbound event before acknowledging the platform delivery. The foundation layer provides the persistence primitive, and the initial runtime orchestrator boundary wires it through `InboundDelivery` and `ImAdapter::acknowledge_inbound_delivery`: the runtime records a new event or recognizes a duplicate before it calls the adapter acknowledgement. Duplicate detection uses the normalized `EventId`, so IM adapters must namespace provider delivery identifiers by platform and scope before handing events to the runtime. A failed persistence attempt must leave the delivery unacknowledged so the platform can retry according to its own transport semantics. Real provider transports still belong inside concrete IM adapters.
 
+Outbound delivery follows the inverse durable boundary. The runtime claims an outbox record before constructing an `OutboundDeliveryAttempt` with a stable delivery id, normalized scope, message, and attempt number. `ImAdapter::deliver_outbound_message` receives that platform-neutral attempt; provider request types, idempotency mechanisms, and transport details remain inside the concrete adapter. The runtime records the adapter outcome before scheduling another attempt.
+
 ### Core and Platform Modules
 
 Core runtime modules should define platform-neutral domain models and behavior:
