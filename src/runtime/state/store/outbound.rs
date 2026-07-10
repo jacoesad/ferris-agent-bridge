@@ -21,7 +21,8 @@ impl StateStore {
         Ok(enqueue_status)
     }
 
-    pub fn claim_next_outbound_delivery(
+    #[cfg(test)]
+    pub(crate) fn claim_next_outbound_delivery(
         &self,
         started_at_unix: u64,
     ) -> Result<Option<OutboundDeliveryRecord>, String> {
@@ -36,7 +37,7 @@ impl StateStore {
         Ok(delivery)
     }
 
-    pub fn claim_next_outbound_delivery_attempt(
+    pub(crate) fn claim_next_outbound_delivery_attempt(
         &self,
         started_at_unix: u64,
         retry_policy: &OutboundRetryPolicy,
@@ -66,7 +67,7 @@ impl StateStore {
         Ok(Some(attempt))
     }
 
-    pub fn mark_outbound_delivery_delivered(
+    pub(crate) fn mark_outbound_delivery_delivered(
         &self,
         id: &OutboundDeliveryId,
         delivered_at_unix: u64,
@@ -78,7 +79,7 @@ impl StateStore {
         Ok(delivery)
     }
 
-    pub fn mark_outbound_delivery_failed(
+    pub(crate) fn mark_outbound_delivery_failed(
         &self,
         id: &OutboundDeliveryId,
         failed_at_unix: u64,
@@ -91,7 +92,7 @@ impl StateStore {
         Ok(delivery)
     }
 
-    pub fn mark_outbound_delivery_uncertain(
+    pub(crate) fn mark_outbound_delivery_uncertain(
         &self,
         id: &OutboundDeliveryId,
         uncertain_at_unix: u64,

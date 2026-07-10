@@ -123,6 +123,7 @@ impl RuntimeState {
             .find(|delivery| delivery.id() == id)
     }
 
+    #[cfg(test)]
     pub(super) fn claim_next_outbound_delivery(
         &mut self,
         started_at_unix: u64,

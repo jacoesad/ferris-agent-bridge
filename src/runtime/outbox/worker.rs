@@ -49,7 +49,7 @@ impl OutboxWorker {
             .claim_next_outbound_delivery_attempt(started_at_unix, &self.retry_policy)
             .map_err(|err| {
                 RuntimeError::recoverable(format!(
-                    "failed to durably confirm the next outbound delivery claim before adapter handoff; the adapter was not called, but reload persisted state before recovery because either the pending or delivering state may be visible: {err}"
+                    "failed to durably confirm the next outbound delivery claim before adapter handoff; the adapter was not called, but reload persisted state before recovery because pending, failed, or delivering may be visible: {err}"
                 ))
             })?
         else {
@@ -183,6 +183,7 @@ mod tests {
                 OutboundDeliveryAttempt, OutboundDeliveryId, OutboundDeliveryRecord,
                 OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker, OutboxWorkerOutcome,
             },
+            persistence::fail_next_write_after_replace,
             session::{Session, SessionId, SessionScope},
             state::{RuntimeState, StateStore},
         },
@@ -530,6 +531,49 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn retry_claim_pre_replace_failure_can_leave_the_previous_failed_state() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let (store, scope) = state_store_with_session("worker-retry-claim-persist-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        store
+            .claim_next_outbound_delivery(11)
+            .expect("first attempt should claim");
+        store
+            .mark_outbound_delivery_failed(delivery.id(), 12, "temporary transport failure")
+            .expect("first attempt should fail");
+        let policy = OutboundRetryPolicy::new(3, 10, 40).expect("valid retry policy");
+        let worker = OutboxWorker::new(store.clone(), policy);
+        let mut adapter = RecordingImAdapter::default();
+        let parent = store
+            .path()
+            .parent()
+            .expect("state path should have a parent");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o500))
+            .expect("fixture permissions should be set");
+
+        let result = worker.process_next_with_clock(&mut adapter, || 22);
+
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions should be restored");
+        let err = result.expect_err("retry claim persistence failure should be reported");
+        assert!(err.message().contains("pending, failed, or delivering"));
+        assert!(adapter.attempts.is_empty());
+        let state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Failed
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn pre_replace_delivered_persistence_failure_leaves_the_attempt_claimed() {
         use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -700,6 +744,130 @@ mod tests {
         assert_eq!(adapter.attempts.len(), 1);
     }
 
+    #[test]
+    fn post_replace_claim_failure_keeps_the_adapter_uninvoked() {
+        let (store, scope) = state_store_with_session("worker-post-replace-claim-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter::default();
+        fail_next_write_after_replace(store.path());
+
+        let result = worker.process_next_with_clock(&mut adapter, || 11);
+
+        let err = result.expect_err("post-replace claim failure should be reported");
+        assert!(err.message().contains("reload persisted state"));
+        assert!(adapter.attempts.is_empty());
+        let state = store.load().expect("updated state should remain readable");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Delivering
+        );
+
+        let idle = worker
+            .process_next_with_clock(&mut adapter, || 12)
+            .expect("claimed delivery should not be sent after claim error");
+        assert_eq!(
+            idle,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert!(adapter.attempts.is_empty());
+    }
+
+    #[test]
+    fn post_replace_delivered_failure_keeps_the_delivery_non_retryable() {
+        let (store, scope) = state_store_with_session("worker-post-replace-delivered-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter {
+            fail_after_replace_on_outcome: Some(store.path().to_path_buf()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let result =
+            worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
+
+        let err = result.expect_err("post-replace delivered failure should be reported");
+        assert!(err.message().contains("reload persisted state"));
+        assert_eq!(adapter.attempts.len(), 1);
+        let state = store.load().expect("updated state should remain readable");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Delivered
+        );
+
+        adapter.fail_after_replace_on_outcome = None;
+        let idle = worker
+            .process_next_with_clock(&mut adapter, || 13)
+            .expect("delivered record should not be retried");
+        assert_eq!(
+            idle,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+    }
+
+    #[test]
+    fn post_replace_uncertain_failure_keeps_the_delivery_non_retryable() {
+        let (store, scope) = state_store_with_session("worker-post-replace-uncertain-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter {
+            failure: Some(OutboundDeliveryFailure::uncertain(
+                "provider acceptance is unknown",
+            )),
+            fail_after_replace_on_outcome: Some(store.path().to_path_buf()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let result =
+            worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
+
+        let err = result.expect_err("post-replace uncertain failure should be reported");
+        assert!(err.message().contains("reload persisted state"));
+        assert_eq!(adapter.attempts.len(), 1);
+        let state = store.load().expect("updated state should remain readable");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Uncertain
+        );
+
+        adapter.fail_after_replace_on_outcome = None;
+        let idle = worker
+            .process_next_with_clock(&mut adapter, || 13)
+            .expect("uncertain record should not be retried");
+        assert_eq!(
+            idle,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+    }
+
     #[derive(Default)]
     struct RecordingImAdapter {
         attempts: Vec<OutboundDeliveryAttempt>,
@@ -707,6 +875,7 @@ mod tests {
         state_check: Option<StateStore>,
         #[cfg(unix)]
         lock_outcome_directory: Option<PathBuf>,
+        fail_after_replace_on_outcome: Option<PathBuf>,
     }
 
     impl RecordingImAdapter {
@@ -747,6 +916,10 @@ mod tests {
             }
 
             self.attempts.push(attempt.clone());
+
+            if let Some(path) = &self.fail_after_replace_on_outcome {
+                fail_next_write_after_replace(path);
+            }
 
             #[cfg(unix)]
             if let Some(path) = &self.lock_outcome_directory {
