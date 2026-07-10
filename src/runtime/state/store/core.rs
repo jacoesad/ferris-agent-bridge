@@ -69,8 +69,12 @@ impl StateStore {
             state.preserve_outbound_deliveries_from(&existing)?;
         }
 
+        self.write_unlocked(&state)
+    }
+
+    pub(super) fn write_unlocked(&self, state: &RuntimeState) -> Result<(), String> {
         state.validate()?;
-        let state_file = state_file_from_state(&state);
+        let state_file = state_file_from_state(state);
         write_json_atomic(self.path(), &state_file).map_err(|err| {
             format!(
                 "failed to save runtime state {}: {err}",

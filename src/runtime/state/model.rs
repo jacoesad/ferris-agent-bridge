@@ -123,6 +123,57 @@ impl RuntimeState {
             .find(|delivery| delivery.id() == id)
     }
 
+    pub(super) fn claim_next_outbound_delivery(
+        &mut self,
+        started_at_unix: u64,
+    ) -> Result<Option<OutboundDeliveryRecord>, String> {
+        let Some(index) = self.outbound_deliveries.iter().position(|delivery| {
+            matches!(
+                delivery.status(),
+                OutboundDeliveryStatus::Pending | OutboundDeliveryStatus::Failed
+            )
+        }) else {
+            return Ok(None);
+        };
+
+        let updated_at_unix = {
+            let delivery = &mut self.outbound_deliveries[index];
+            delivery.begin_delivery(started_at_unix)?;
+            delivery.updated_at_unix()
+        };
+        self.touch_at(updated_at_unix.max(unix_seconds_now()));
+        Ok(Some(self.outbound_deliveries[index].clone()))
+    }
+
+    pub(super) fn mark_outbound_delivery_delivered(
+        &mut self,
+        id: &OutboundDeliveryId,
+        delivered_at_unix: u64,
+    ) -> Result<OutboundDeliveryRecord, String> {
+        let updated_delivery = {
+            let delivery = self.outbound_delivery_mut(id)?;
+            delivery.mark_delivered(delivered_at_unix)?;
+            delivery.clone()
+        };
+        self.touch_at(updated_delivery.updated_at_unix().max(unix_seconds_now()));
+        Ok(updated_delivery)
+    }
+
+    pub(super) fn mark_outbound_delivery_failed(
+        &mut self,
+        id: &OutboundDeliveryId,
+        failed_at_unix: u64,
+        error: impl Into<String>,
+    ) -> Result<OutboundDeliveryRecord, String> {
+        let updated_delivery = {
+            let delivery = self.outbound_delivery_mut(id)?;
+            delivery.mark_failed(failed_at_unix, error)?;
+            delivery.clone()
+        };
+        self.touch_at(updated_delivery.updated_at_unix().max(unix_seconds_now()));
+        Ok(updated_delivery)
+    }
+
     pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {
         {
             let run = self.run_mut(id)?;
@@ -311,6 +362,16 @@ impl RuntimeState {
             .ok_or_else(|| format!("unknown run id {id}"))
     }
 
+    fn outbound_delivery_mut(
+        &mut self,
+        id: &OutboundDeliveryId,
+    ) -> Result<&mut OutboundDeliveryRecord, String> {
+        self.outbound_deliveries
+            .iter_mut()
+            .find(|delivery| delivery.id() == id)
+            .ok_or_else(|| format!("unknown outbound delivery id {id}"))
+    }
+
     fn record_inbound_event_at(
         &mut self,
         event: &Event,
@@ -453,7 +514,10 @@ mod tests {
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
         message::{Message, MessageAuthor, MessageContent, MessageId},
-        outbox::{OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord},
+        outbox::{
+            OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
+            OutboundDeliveryStatus,
+        },
         run::{RunId, RunRecord, RunStatus},
         session::{Session, SessionId, SessionScope},
     };
@@ -579,6 +643,120 @@ mod tests {
 
         assert!(err.contains("cannot enqueue from Delivering"));
         assert!(state.outbound_deliveries().is_empty());
+    }
+    #[test]
+    fn state_claims_pending_and_failed_outbound_deliveries() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let session_id = session.id().clone();
+        let pending = outbound_delivery_fixture("out_pending", session_id.clone(), 12);
+        let mut failed = outbound_delivery_fixture("out_failed", session_id, 13);
+        failed.begin_delivery(14).expect("delivery should start");
+        failed
+            .mark_failed(15, "transport failed")
+            .expect("delivery should fail");
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state
+            .enqueue_outbound_delivery(pending.clone())
+            .expect("pending delivery should enqueue");
+        state.outbound_deliveries.push(failed.clone());
+
+        let claimed = state
+            .claim_next_outbound_delivery(16)
+            .expect("pending delivery should claim")
+            .expect("pending delivery should be returned");
+        assert_eq!(claimed.id(), pending.id());
+        assert_eq!(claimed.status(), OutboundDeliveryStatus::Delivering);
+        assert_eq!(claimed.delivery_attempts(), 1);
+
+        let claimed = state
+            .claim_next_outbound_delivery(17)
+            .expect("failed delivery should be retryable")
+            .expect("failed delivery should be returned");
+        assert_eq!(claimed.id(), failed.id());
+        assert_eq!(claimed.status(), OutboundDeliveryStatus::Delivering);
+        assert_eq!(claimed.delivery_attempts(), 2);
+
+        assert!(
+            state
+                .claim_next_outbound_delivery(18)
+                .expect("no eligible delivery should be ok")
+                .is_none()
+        );
+        state.validate().expect("state should remain valid");
+    }
+    #[test]
+    fn state_marks_claimed_outbound_deliveries_delivered_or_failed() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let session_id = session.id().clone();
+        let delivered_id = OutboundDeliveryId::new("out_delivered").expect("valid id");
+        let failed_id = OutboundDeliveryId::new("out_failed").expect("valid id");
+        let delivered = outbound_delivery_fixture(delivered_id.as_str(), session_id.clone(), 12);
+        let failed = outbound_delivery_fixture(failed_id.as_str(), session_id, 13);
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state
+            .enqueue_outbound_delivery(delivered)
+            .expect("delivery should enqueue");
+        state
+            .enqueue_outbound_delivery(failed)
+            .expect("delivery should enqueue");
+
+        state
+            .claim_next_outbound_delivery(14)
+            .expect("delivery should claim");
+        let delivered = state
+            .mark_outbound_delivery_delivered(&delivered_id, 15)
+            .expect("claimed delivery should complete");
+        assert_eq!(delivered.status(), OutboundDeliveryStatus::Delivered);
+        assert_eq!(delivered.delivered_at_unix(), Some(15));
+
+        state
+            .claim_next_outbound_delivery(16)
+            .expect("delivery should claim");
+        let failed = state
+            .mark_outbound_delivery_failed(&failed_id, 17, "transport failed")
+            .expect("claimed delivery should fail");
+        assert_eq!(failed.status(), OutboundDeliveryStatus::Failed);
+        assert_eq!(failed.last_error(), Some("transport failed"));
+        state.validate().expect("state should remain valid");
+    }
+    #[test]
+    fn state_rejects_invalid_outbound_consumption_transitions() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = session_fixture(&scope, 10, 10);
+        let session_id = session.id().clone();
+        let delivery_id = OutboundDeliveryId::new("out_1").expect("valid id");
+        let delivery = outbound_delivery_fixture(delivery_id.as_str(), session_id, 12);
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state
+            .enqueue_outbound_delivery(delivery)
+            .expect("delivery should enqueue");
+
+        let err = state
+            .mark_outbound_delivery_delivered(&delivery_id, 13)
+            .expect_err("pending delivery should not complete");
+        assert!(err.contains("cannot complete from Pending"));
+
+        let unknown_id = OutboundDeliveryId::new("out_missing").expect("valid id");
+        let err = state
+            .mark_outbound_delivery_failed(&unknown_id, 13, "transport failed")
+            .expect_err("unknown delivery should not fail");
+        assert!(err.contains("unknown outbound delivery id"));
+
+        state
+            .claim_next_outbound_delivery(13)
+            .expect("delivery should claim");
+        state
+            .mark_outbound_delivery_delivered(&delivery_id, 14)
+            .expect("claimed delivery should complete");
+        let err = state
+            .claim_next_outbound_delivery(15)
+            .expect("terminal deliveries are not retryable");
+        assert!(err.is_none());
     }
     #[test]
     fn state_transitions_persisted_run_records() {
