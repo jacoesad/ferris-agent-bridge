@@ -94,6 +94,7 @@ mod tests {
             error::ErrorClass,
             event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
             message::Message,
+            outbox::OutboundDeliveryAttempt,
             state::StateStore,
         },
     };
@@ -235,6 +236,13 @@ mod tests {
             }
 
             Ok(())
+        }
+
+        fn deliver_outbound_message(
+            &mut self,
+            _attempt: &OutboundDeliveryAttempt,
+        ) -> Result<(), String> {
+            Err("outbound delivery is not used by inbound orchestrator tests".to_owned())
         }
     }
 

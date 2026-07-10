@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::runtime::event::{Event, EventId, InboundEventRecordStatus};
+use crate::runtime::{
+    event::{Event, EventId, InboundEventRecordStatus},
+    outbox::OutboundDeliveryAttempt,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InboundDeliveryAckToken(String);
@@ -89,6 +92,9 @@ pub trait ImAdapter {
         &mut self,
         acknowledgement: &InboundDeliveryAcknowledgement,
     ) -> Result<(), String>;
+
+    fn deliver_outbound_message(&mut self, attempt: &OutboundDeliveryAttempt)
+    -> Result<(), String>;
 }
 
 #[cfg(test)]

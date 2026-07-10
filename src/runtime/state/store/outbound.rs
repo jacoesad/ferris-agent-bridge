@@ -1,5 +1,6 @@
 use crate::runtime::outbox::{
-    OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
+    OutboundDeliveryAttempt, OutboundDeliveryEnqueueStatus, OutboundDeliveryId,
+    OutboundDeliveryRecord, OutboundRetryPolicy,
 };
 
 use super::StateStore;
@@ -33,6 +34,36 @@ impl StateStore {
         }
 
         Ok(delivery)
+    }
+
+    pub fn claim_next_outbound_delivery_attempt(
+        &self,
+        started_at_unix: u64,
+        retry_policy: &OutboundRetryPolicy,
+    ) -> Result<Option<OutboundDeliveryAttempt>, String> {
+        let _guard = self.lock_write()?;
+        let mut state = self.load()?;
+        let delivery = state.claim_next_outbound_delivery_where(started_at_unix, |delivery| {
+            retry_policy.is_due(delivery, started_at_unix)
+        })?;
+        let Some(delivery) = delivery else {
+            return Ok(None);
+        };
+        let session_scope = state
+            .session(delivery.session_id())
+            .ok_or_else(|| {
+                format!(
+                    "outbound delivery {} references unknown session {}",
+                    delivery.id(),
+                    delivery.session_id()
+                )
+            })?
+            .scope()
+            .clone();
+        let attempt = OutboundDeliveryAttempt::from_record(&delivery, session_scope)?;
+
+        self.write_unlocked(&state)?;
+        Ok(Some(attempt))
     }
 
     pub fn mark_outbound_delivery_delivered(

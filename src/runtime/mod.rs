@@ -19,8 +19,9 @@ pub use logging::{LogContext, LogLevel, Redactor, StructuredLogEvent};
 pub use message::{Message, MessageAuthor, MessageContent, MessageId};
 pub use orchestrator::{InboundDeliveryOutcome, RuntimeOrchestrator};
 pub use outbox::{
-    OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
-    OutboundDeliveryStatus,
+    OutboundDeliveryAttempt, OutboundDeliveryEnqueueStatus, OutboundDeliveryId,
+    OutboundDeliveryRecord, OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker,
+    OutboxWorkerOutcome,
 };
 pub use run::{RunId, RunRecord, RunStatus};
 pub use session::{Session, SessionId, SessionScope};

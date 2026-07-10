@@ -1,0 +1,666 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::adapter::ImAdapter;
+
+use super::{OutboundDeliveryId, OutboundRetryPolicy};
+use crate::runtime::{error::RuntimeError, state::StateStore};
+
+#[derive(Debug, Clone)]
+pub struct OutboxWorker {
+    state_store: StateStore,
+    retry_policy: OutboundRetryPolicy,
+}
+
+impl OutboxWorker {
+    pub fn new(state_store: StateStore, retry_policy: OutboundRetryPolicy) -> Self {
+        Self {
+            state_store,
+            retry_policy,
+        }
+    }
+
+    pub fn state_store(&self) -> &StateStore {
+        &self.state_store
+    }
+
+    pub fn retry_policy(&self) -> &OutboundRetryPolicy {
+        &self.retry_policy
+    }
+
+    pub fn process_next<A>(&self, im_adapter: &mut A) -> Result<OutboxWorkerOutcome, RuntimeError>
+    where
+        A: ImAdapter,
+    {
+        self.process_next_with_clock(im_adapter, unix_seconds_now)
+    }
+
+    fn process_next_with_clock<A, F>(
+        &self,
+        im_adapter: &mut A,
+        mut now_unix: F,
+    ) -> Result<OutboxWorkerOutcome, RuntimeError>
+    where
+        A: ImAdapter,
+        F: FnMut() -> u64,
+    {
+        let started_at_unix = now_unix();
+        let Some(attempt) = self
+            .state_store
+            .claim_next_outbound_delivery_attempt(started_at_unix, &self.retry_policy)
+            .map_err(|err| {
+                RuntimeError::recoverable(format!(
+                    "failed to claim the next outbound delivery before adapter handoff: {err}"
+                ))
+            })?
+        else {
+            let state = self.state_store.load().map_err(|err| {
+                RuntimeError::recoverable(format!(
+                    "failed to inspect deferred outbound deliveries: {err}"
+                ))
+            })?;
+            let next_attempt_at_unix = state
+                .outbound_deliveries()
+                .iter()
+                .filter_map(|delivery| self.retry_policy.next_attempt_at_unix(delivery))
+                .min();
+
+            return Ok(OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix,
+            });
+        };
+
+        let delivery_id = attempt.delivery_id().clone();
+        let attempt_number = attempt.attempt_number();
+        let adapter_result = im_adapter.deliver_outbound_message(&attempt);
+        let finished_at_unix = now_unix().max(started_at_unix);
+
+        match adapter_result {
+            Ok(()) => {
+                self.state_store
+                    .mark_outbound_delivery_delivered(&delivery_id, finished_at_unix)
+                    .map_err(|err| {
+                        RuntimeError::recoverable(format!(
+                            "outbound adapter delivered {delivery_id}, but the delivered outcome could not be persisted: {err}"
+                        ))
+                    })?;
+
+                Ok(OutboxWorkerOutcome::Delivered {
+                    delivery_id,
+                    attempt_number,
+                })
+            }
+            Err(error) => {
+                let error = normalize_adapter_error(error);
+                let failed = self
+                    .state_store
+                    .mark_outbound_delivery_failed(
+                        &delivery_id,
+                        finished_at_unix,
+                        error.clone(),
+                    )
+                    .map_err(|err| {
+                        RuntimeError::recoverable(format!(
+                            "outbound adapter failed {delivery_id}, but the failed outcome could not be persisted: {err}"
+                        ))
+                    })?;
+                let next_attempt_at_unix = self.retry_policy.next_attempt_at_unix(&failed);
+
+                Ok(OutboxWorkerOutcome::Failed {
+                    delivery_id,
+                    attempt_number,
+                    error,
+                    next_attempt_at_unix,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboxWorkerOutcome {
+    Idle {
+        next_attempt_at_unix: Option<u64>,
+    },
+    Delivered {
+        delivery_id: OutboundDeliveryId,
+        attempt_number: u32,
+    },
+    Failed {
+        delivery_id: OutboundDeliveryId,
+        attempt_number: u32,
+        error: String,
+        next_attempt_at_unix: Option<u64>,
+    },
+}
+
+fn normalize_adapter_error(error: String) -> String {
+    if error.trim().is_empty() {
+        "outbound adapter delivery failed without an error message".to_owned()
+    } else {
+        error
+    }
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use crate::{
+        adapter::{ImAdapter, InboundDeliveryAcknowledgement},
+        runtime::{
+            error::ErrorClass,
+            message::{Message, MessageAuthor, MessageContent, MessageId},
+            outbox::{
+                OutboundDeliveryAttempt, OutboundDeliveryId, OutboundDeliveryRecord,
+                OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker, OutboxWorkerOutcome,
+            },
+            session::{Session, SessionId, SessionScope},
+            state::{RuntimeState, StateStore},
+        },
+    };
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn worker_delivers_only_after_persisting_the_claim() {
+        let (store, scope) = state_store_with_session("worker-delivers");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter::with_state_check(store.clone());
+        let mut times = [11, 12].into_iter();
+
+        let outcome = worker
+            .process_next_with_clock(&mut adapter, || times.next().expect("clock value"))
+            .expect("delivery should succeed");
+
+        assert_eq!(
+            outcome,
+            OutboxWorkerOutcome::Delivered {
+                delivery_id: delivery.id().clone(),
+                attempt_number: 1,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+        assert_eq!(adapter.attempts[0].delivery_id(), delivery.id());
+        assert_eq!(
+            adapter.attempts[0].idempotency_key(),
+            delivery.id().as_str()
+        );
+        assert_eq!(adapter.attempts[0].session_scope(), &scope);
+        assert_eq!(adapter.attempts[0].message(), delivery.message());
+
+        let state = store.load().expect("state should load");
+        let stored = state
+            .outbound_delivery(delivery.id())
+            .expect("delivery should remain stored");
+        assert_eq!(stored.status(), OutboundDeliveryStatus::Delivered);
+        assert_eq!(stored.delivered_at_unix(), Some(12));
+    }
+
+    #[test]
+    fn worker_defers_failed_delivery_until_backoff_expires() {
+        let (store, scope) = state_store_with_session("worker-backoff");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let policy = OutboundRetryPolicy::new(3, 10, 40).expect("valid retry policy");
+        let worker = OutboxWorker::new(store.clone(), policy);
+        let mut adapter = RecordingImAdapter {
+            failure: Some("temporary transport failure".to_owned()),
+            ..RecordingImAdapter::default()
+        };
+        let mut first_times = [11, 12].into_iter();
+
+        let first = worker
+            .process_next_with_clock(&mut adapter, || {
+                first_times.next().expect("first clock value")
+            })
+            .expect("adapter failure should become a persisted outcome");
+        assert_eq!(
+            first,
+            OutboxWorkerOutcome::Failed {
+                delivery_id: delivery.id().clone(),
+                attempt_number: 1,
+                error: "temporary transport failure".to_owned(),
+                next_attempt_at_unix: Some(22),
+            }
+        );
+
+        let deferred = worker
+            .process_next_with_clock(&mut adapter, || 21)
+            .expect("deferred retry should be idle");
+        assert_eq!(
+            deferred,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: Some(22),
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+
+        adapter.failure = None;
+        let mut retry_times = [22, 23].into_iter();
+        let retry = worker
+            .process_next_with_clock(&mut adapter, || {
+                retry_times.next().expect("retry clock value")
+            })
+            .expect("due retry should deliver");
+        assert_eq!(
+            retry,
+            OutboxWorkerOutcome::Delivered {
+                delivery_id: delivery.id().clone(),
+                attempt_number: 2,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 2);
+    }
+
+    #[test]
+    fn worker_leaves_exhausted_failure_inspectable_without_retrying() {
+        let (store, scope) = state_store_with_session("worker-exhausted");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let policy = OutboundRetryPolicy::new(1, 10, 40).expect("valid retry policy");
+        let worker = OutboxWorker::new(store.clone(), policy);
+        let mut adapter = RecordingImAdapter {
+            failure: Some("permanent transport failure".to_owned()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let failed = worker
+            .process_next_with_clock(&mut adapter, || times.next().expect("clock value"))
+            .expect("failure should persist");
+        assert!(matches!(
+            failed,
+            OutboxWorkerOutcome::Failed {
+                next_attempt_at_unix: None,
+                ..
+            }
+        ));
+
+        let idle = worker
+            .process_next_with_clock(&mut adapter, || u64::MAX)
+            .expect("exhausted delivery should remain idle");
+        assert_eq!(
+            idle,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+
+        let state = store.load().expect("state should load");
+        let stored = state
+            .outbound_delivery(delivery.id())
+            .expect("failed delivery should remain stored");
+        assert_eq!(stored.status(), OutboundDeliveryStatus::Failed);
+        assert_eq!(stored.last_error(), Some("permanent transport failure"));
+    }
+
+    #[test]
+    fn deferred_failure_does_not_block_a_later_pending_delivery() {
+        let (store, scope) = state_store_with_session("worker-skips-deferred");
+        let session_id = SessionId::for_scope(&scope);
+        let deferred = outbound_delivery_fixture("out_deferred", session_id.clone(), 10);
+        let pending = outbound_delivery_fixture("out_pending", session_id, 12);
+        store
+            .enqueue_outbound_delivery(deferred.clone())
+            .expect("first delivery should enqueue");
+        store
+            .claim_next_outbound_delivery(11)
+            .expect("first delivery should claim");
+        store
+            .mark_outbound_delivery_failed(deferred.id(), 12, "temporary failure")
+            .expect("first delivery should fail");
+        store
+            .enqueue_outbound_delivery(pending.clone())
+            .expect("second delivery should enqueue");
+        let policy = OutboundRetryPolicy::new(3, 10, 40).expect("valid retry policy");
+        let worker = OutboxWorker::new(store.clone(), policy);
+        let mut adapter = RecordingImAdapter::default();
+        let mut times = [13, 14].into_iter();
+
+        let outcome = worker
+            .process_next_with_clock(&mut adapter, || times.next().expect("clock value"))
+            .expect("later pending delivery should be processed");
+
+        assert_eq!(
+            outcome,
+            OutboxWorkerOutcome::Delivered {
+                delivery_id: pending.id().clone(),
+                attempt_number: 1,
+            }
+        );
+        assert_eq!(adapter.attempts[0].delivery_id(), pending.id());
+        let state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .outbound_delivery(deferred.id())
+                .expect("deferred delivery should remain")
+                .status(),
+            OutboundDeliveryStatus::Failed
+        );
+    }
+
+    #[test]
+    fn worker_normalizes_empty_adapter_errors_before_persisting() {
+        let (store, scope) = state_store_with_session("worker-empty-error");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter {
+            failure: Some("  ".to_owned()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let outcome = worker
+            .process_next_with_clock(&mut adapter, || times.next().expect("clock value"))
+            .expect("empty adapter error should be normalized");
+
+        let OutboxWorkerOutcome::Failed { error, .. } = outcome else {
+            panic!("adapter failure should return a failed outcome");
+        };
+        assert_eq!(
+            error,
+            "outbound adapter delivery failed without an error message"
+        );
+        let state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .last_error(),
+            Some("outbound adapter delivery failed without an error message")
+        );
+    }
+
+    #[test]
+    fn worker_does_not_move_outcome_time_backwards_when_the_clock_rolls_back() {
+        let (store, scope) = state_store_with_session("worker-clock-rollback");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter::default();
+        let mut times = [11, 9].into_iter();
+
+        worker
+            .process_next_with_clock(&mut adapter, || times.next().expect("clock value"))
+            .expect("delivery should survive clock rollback");
+
+        let state = store.load().expect("state should load");
+        let stored = state
+            .outbound_delivery(delivery.id())
+            .expect("delivery should remain stored");
+        assert_eq!(stored.status(), OutboundDeliveryStatus::Delivered);
+        assert_eq!(stored.delivered_at_unix(), Some(11));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claim_persistence_failure_does_not_call_the_adapter() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let (store, scope) = state_store_with_session("worker-claim-persist-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter::default();
+        let parent = store
+            .path()
+            .parent()
+            .expect("state path should have a parent");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o500))
+            .expect("fixture permissions should be set");
+
+        let result = worker.process_next_with_clock(&mut adapter, || 11);
+
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions should be restored");
+        let err = result.expect_err("claim persistence failure should be reported");
+        assert_eq!(err.class(), ErrorClass::Recoverable);
+        assert!(err.message().contains("before adapter handoff"));
+        assert!(adapter.attempts.is_empty());
+
+        let state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Pending
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delivered_persistence_failure_leaves_an_uncertain_attempt_claimed() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let (store, scope) = state_store_with_session("worker-outcome-persist-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let parent = store
+            .path()
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let mut adapter = RecordingImAdapter {
+            state_check: Some(store.clone()),
+            lock_outcome_directory: Some(parent.clone()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let result =
+            worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions should be restored");
+        let err = result.expect_err("outcome persistence failure should be reported");
+        assert_eq!(err.class(), ErrorClass::Recoverable);
+        assert!(err.message().contains("delivered outcome"));
+        assert_eq!(adapter.attempts.len(), 1);
+
+        let state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Delivering
+        );
+
+        adapter.lock_outcome_directory = None;
+        let idle = worker
+            .process_next_with_clock(&mut adapter, || 13)
+            .expect("uncertain delivery should not retry immediately");
+        assert_eq!(
+            idle,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_persistence_failure_leaves_the_attempt_claimed_without_retrying() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let (store, scope) = state_store_with_session("worker-failed-persist-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let parent = store
+            .path()
+            .parent()
+            .expect("state path should have a parent")
+            .to_path_buf();
+        let mut adapter = RecordingImAdapter {
+            failure: Some("transport failed".to_owned()),
+            state_check: Some(store.clone()),
+            lock_outcome_directory: Some(parent.clone()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let result =
+            worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions should be restored");
+        let err = result.expect_err("failed outcome persistence should be reported");
+        assert_eq!(err.class(), ErrorClass::Recoverable);
+        assert!(err.message().contains("failed outcome"));
+        assert_eq!(adapter.attempts.len(), 1);
+
+        let state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .outbound_delivery(delivery.id())
+                .expect("delivery should remain stored")
+                .status(),
+            OutboundDeliveryStatus::Delivering
+        );
+
+        adapter.lock_outcome_directory = None;
+        let idle = worker
+            .process_next_with_clock(&mut adapter, || 13)
+            .expect("uncertain delivery should not retry immediately");
+        assert_eq!(
+            idle,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+    }
+
+    #[derive(Default)]
+    struct RecordingImAdapter {
+        attempts: Vec<OutboundDeliveryAttempt>,
+        failure: Option<String>,
+        state_check: Option<StateStore>,
+        #[cfg(unix)]
+        lock_outcome_directory: Option<PathBuf>,
+    }
+
+    impl RecordingImAdapter {
+        fn with_state_check(state_store: StateStore) -> Self {
+            Self {
+                state_check: Some(state_store),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl ImAdapter for RecordingImAdapter {
+        fn acknowledge_inbound_delivery(
+            &mut self,
+            _acknowledgement: &InboundDeliveryAcknowledgement,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn deliver_outbound_message(
+            &mut self,
+            attempt: &OutboundDeliveryAttempt,
+        ) -> Result<(), String> {
+            if let Some(state_store) = &self.state_check {
+                let state = state_store.load()?;
+                let stored = state
+                    .outbound_delivery(attempt.delivery_id())
+                    .ok_or_else(|| "adapter attempt is missing from state".to_owned())?;
+                if stored.status() != OutboundDeliveryStatus::Delivering {
+                    return Err(
+                        "adapter received an outbound delivery before durable claim".to_owned()
+                    );
+                }
+            }
+
+            self.attempts.push(attempt.clone());
+
+            #[cfg(unix)]
+            if let Some(path) = &self.lock_outcome_directory {
+                use std::{fs, os::unix::fs::PermissionsExt};
+
+                fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+                    .map_err(|err| format!("failed to lock outcome directory: {err}"))?;
+            }
+
+            match &self.failure {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn state_store_with_session(label: &str) -> (StateStore, SessionScope) {
+        let path = test_path(label).join("runtime.state.json");
+        let store = StateStore::new(path);
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let mut state = RuntimeState::new();
+        state.upsert_session(Session::new(scope.clone()));
+        store.save(&state).expect("initial state should save");
+        (store, scope)
+    }
+
+    fn outbound_delivery_fixture(
+        id: &str,
+        session_id: SessionId,
+        created_at_unix: u64,
+    ) -> OutboundDeliveryRecord {
+        let message = Message::new(
+            MessageId::new(format!("msg_{id}")).expect("valid message id"),
+            Some(session_id.clone()),
+            MessageAuthor::Agent,
+            MessageContent::text(format!("reply for {id}")).expect("valid text"),
+            created_at_unix,
+        );
+
+        OutboundDeliveryRecord::new(
+            OutboundDeliveryId::new(id).expect("valid delivery id"),
+            session_id,
+            message,
+            created_at_unix,
+        )
+        .expect("valid outbound delivery")
+    }
+
+    fn test_path(label: &str) -> PathBuf {
+        let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ferris-agent-bridge-outbox-worker-{}-{label}-{sequence}",
+            std::process::id()
+        ))
+    }
+}

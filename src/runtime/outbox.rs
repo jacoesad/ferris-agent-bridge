@@ -2,9 +2,15 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+mod retry;
+mod worker;
+
+pub use retry::OutboundRetryPolicy;
+pub use worker::{OutboxWorker, OutboxWorkerOutcome};
+
 use super::{
     message::{Message, MessageAuthor},
-    session::SessionId,
+    session::{SessionId, SessionScope},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -54,6 +60,63 @@ pub enum OutboundDeliveryStatus {
 pub enum OutboundDeliveryEnqueueStatus {
     Queued,
     Duplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundDeliveryAttempt {
+    delivery_id: OutboundDeliveryId,
+    session_scope: SessionScope,
+    message: Message,
+    attempt_number: u32,
+}
+
+impl OutboundDeliveryAttempt {
+    pub(super) fn from_record(
+        delivery: &OutboundDeliveryRecord,
+        session_scope: SessionScope,
+    ) -> Result<Self, String> {
+        if delivery.status() != OutboundDeliveryStatus::Delivering {
+            return Err(format!(
+                "outbound delivery {} cannot create an adapter attempt from {:?}",
+                delivery.id(),
+                delivery.status()
+            ));
+        }
+
+        if SessionId::for_scope(&session_scope) != *delivery.session_id() {
+            return Err(format!(
+                "outbound delivery {} session scope does not match its session id",
+                delivery.id()
+            ));
+        }
+
+        Ok(Self {
+            delivery_id: delivery.id().clone(),
+            session_scope,
+            message: delivery.message().clone(),
+            attempt_number: delivery.delivery_attempts(),
+        })
+    }
+
+    pub fn delivery_id(&self) -> &OutboundDeliveryId {
+        &self.delivery_id
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        self.delivery_id.as_str()
+    }
+
+    pub fn session_scope(&self) -> &SessionScope {
+        &self.session_scope
+    }
+
+    pub fn message(&self) -> &Message {
+        &self.message
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -391,7 +454,9 @@ fn is_valid_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutboundDeliveryId, OutboundDeliveryRecord, OutboundDeliveryStatus};
+    use super::{
+        OutboundDeliveryAttempt, OutboundDeliveryId, OutboundDeliveryRecord, OutboundDeliveryStatus,
+    };
     use crate::runtime::{
         message::{Message, MessageAuthor, MessageContent, MessageId},
         session::{SessionId, SessionScope},
@@ -426,6 +491,29 @@ mod tests {
             .expect("delivery should complete");
         assert_eq!(delivery.status(), OutboundDeliveryStatus::Delivered);
         assert_eq!(delivery.delivered_at_unix(), Some(14));
+    }
+
+    #[test]
+    fn outbound_attempt_requires_a_claimed_record_and_matching_scope() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let mut delivery = delivery_fixture("out_1", 10);
+
+        let err = OutboundDeliveryAttempt::from_record(&delivery, scope.clone())
+            .expect_err("pending deliveries cannot become adapter attempts");
+        assert!(err.contains("from Pending"));
+
+        delivery.begin_delivery(11).expect("delivery should claim");
+        let attempt = OutboundDeliveryAttempt::from_record(&delivery, scope)
+            .expect("claimed delivery should become an attempt");
+        assert_eq!(attempt.delivery_id(), delivery.id());
+        assert_eq!(attempt.idempotency_key(), delivery.id().as_str());
+        assert_eq!(attempt.message(), delivery.message());
+        assert_eq!(attempt.attempt_number(), 1);
+
+        let other_scope = SessionScope::new("lark", "chat:oc_other").expect("valid scope");
+        let err = OutboundDeliveryAttempt::from_record(&delivery, other_scope)
+            .expect_err("scope must match the persisted session");
+        assert!(err.contains("session scope"));
     }
 
     #[test]

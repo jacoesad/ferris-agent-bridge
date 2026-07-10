@@ -127,11 +127,22 @@ impl RuntimeState {
         &mut self,
         started_at_unix: u64,
     ) -> Result<Option<OutboundDeliveryRecord>, String> {
+        self.claim_next_outbound_delivery_where(started_at_unix, |_| true)
+    }
+
+    pub(super) fn claim_next_outbound_delivery_where<F>(
+        &mut self,
+        started_at_unix: u64,
+        mut is_eligible: F,
+    ) -> Result<Option<OutboundDeliveryRecord>, String>
+    where
+        F: FnMut(&OutboundDeliveryRecord) -> bool,
+    {
         let Some(index) = self.outbound_deliveries.iter().position(|delivery| {
             matches!(
                 delivery.status(),
                 OutboundDeliveryStatus::Pending | OutboundDeliveryStatus::Failed
-            )
+            ) && is_eligible(delivery)
         }) else {
             return Ok(None);
         };
