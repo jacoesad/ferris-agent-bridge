@@ -19,6 +19,9 @@ use std::{
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
+static FAIL_BEFORE_REPLACE_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
 static FAIL_AFTER_REPLACE_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
@@ -43,6 +46,10 @@ pub(super) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Res
         file.write_all(&encoded)?;
         file.sync_all()?;
         drop(file);
+        #[cfg(test)]
+        if take_fail_before_replace(path) {
+            return Err(io::Error::other("injected failure before atomic replace"));
+        }
         replace_file(&temp_path, path)?;
         #[cfg(test)]
         if take_fail_after_replace(path) {
@@ -60,6 +67,14 @@ pub(super) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Res
 }
 
 #[cfg(test)]
+pub(super) fn fail_next_write_before_replace(path: &Path) {
+    fail_before_replace_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(test)]
 pub(super) fn fail_next_write_after_replace(path: &Path) {
     fail_after_replace_paths()
         .lock()
@@ -68,11 +83,24 @@ pub(super) fn fail_next_write_after_replace(path: &Path) {
 }
 
 #[cfg(test)]
+fn take_fail_before_replace(path: &Path) -> bool {
+    fail_before_replace_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path)
+}
+
+#[cfg(test)]
 fn take_fail_after_replace(path: &Path) -> bool {
     fail_after_replace_paths()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(path)
+}
+
+#[cfg(test)]
+fn fail_before_replace_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    FAIL_BEFORE_REPLACE_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
 #[cfg(test)]

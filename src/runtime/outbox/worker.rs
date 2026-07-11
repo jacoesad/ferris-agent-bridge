@@ -188,7 +188,7 @@ mod tests {
                 OutboundDeliveryAttempt, OutboundDeliveryId, OutboundDeliveryRecord,
                 OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker, OutboxWorkerOutcome,
             },
-            persistence::fail_next_write_after_replace,
+            persistence::{fail_next_write_after_replace, fail_next_write_before_replace},
             session::{Session, SessionId, SessionScope},
             state::{RuntimeState, StateStore},
         },
@@ -606,10 +606,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn claim_persistence_failure_does_not_call_the_adapter() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let (store, scope) = state_store_with_session("worker-claim-persist-failure");
         let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
         store
@@ -617,17 +614,10 @@ mod tests {
             .expect("delivery should enqueue");
         let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
         let mut adapter = RecordingImAdapter::default();
-        let parent = store
-            .path()
-            .parent()
-            .expect("state path should have a parent");
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = worker.process_next_with_clock(&mut adapter, || 11);
 
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("claim persistence failure should be reported");
         assert_eq!(err.class(), ErrorClass::Recoverable);
         assert!(err.message().contains("before adapter handoff"));
@@ -645,10 +635,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn retry_claim_pre_replace_failure_can_leave_the_previous_failed_state() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let (store, scope) = state_store_with_session("worker-retry-claim-persist-failure");
         let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
         store
@@ -663,17 +650,10 @@ mod tests {
         let policy = OutboundRetryPolicy::new(3, 10, 40).expect("valid retry policy");
         let worker = OutboxWorker::new(store.clone(), policy);
         let mut adapter = RecordingImAdapter::default();
-        let parent = store
-            .path()
-            .parent()
-            .expect("state path should have a parent");
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = worker.process_next_with_clock(&mut adapter, || 22);
 
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("retry claim persistence failure should be reported");
         assert!(err.message().contains("pending, failed, or delivering"));
         assert!(adapter.attempts.is_empty());
@@ -688,24 +668,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn pre_replace_delivered_persistence_failure_leaves_the_attempt_claimed() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let (store, scope) = state_store_with_session("worker-outcome-persist-failure");
         let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
         store
             .enqueue_outbound_delivery(delivery.clone())
             .expect("delivery should enqueue");
         let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
-        let parent = store
-            .path()
-            .parent()
-            .expect("state path should have a parent")
-            .to_path_buf();
         let mut adapter = RecordingImAdapter {
             state_check: Some(store.clone()),
-            lock_outcome_directory: Some(parent.clone()),
+            fail_before_replace_on_outcome: Some(store.path().to_path_buf()),
             ..RecordingImAdapter::default()
         };
         let mut times = [11, 12].into_iter();
@@ -713,8 +685,6 @@ mod tests {
         let result =
             worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
 
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("outcome persistence failure should be reported");
         assert_eq!(err.class(), ErrorClass::Recoverable);
         assert!(err.message().contains("delivered outcome"));
@@ -730,7 +700,7 @@ mod tests {
             OutboundDeliveryStatus::Delivering
         );
 
-        adapter.lock_outcome_directory = None;
+        adapter.fail_before_replace_on_outcome = None;
         let idle = worker
             .process_next_with_clock(&mut adapter, || 13)
             .expect("uncertain delivery should not retry immediately");
@@ -744,25 +714,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn pre_replace_failed_persistence_failure_leaves_the_attempt_claimed() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let (store, scope) = state_store_with_session("worker-failed-persist-failure");
         let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
         store
             .enqueue_outbound_delivery(delivery.clone())
             .expect("delivery should enqueue");
         let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
-        let parent = store
-            .path()
-            .parent()
-            .expect("state path should have a parent")
-            .to_path_buf();
         let mut adapter = RecordingImAdapter {
             failure: Some(OutboundDeliveryFailure::retryable("transport failed")),
             state_check: Some(store.clone()),
-            lock_outcome_directory: Some(parent.clone()),
+            fail_before_replace_on_outcome: Some(store.path().to_path_buf()),
             ..RecordingImAdapter::default()
         };
         let mut times = [11, 12].into_iter();
@@ -770,8 +732,6 @@ mod tests {
         let result =
             worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
 
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("failed outcome persistence should be reported");
         assert_eq!(err.class(), ErrorClass::Recoverable);
         assert!(err.message().contains("failed outcome"));
@@ -787,7 +747,7 @@ mod tests {
             OutboundDeliveryStatus::Delivering
         );
 
-        adapter.lock_outcome_directory = None;
+        adapter.fail_before_replace_on_outcome = None;
         let idle = worker
             .process_next_with_clock(&mut adapter, || 13)
             .expect("uncertain delivery should not retry immediately");
@@ -801,27 +761,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn pre_replace_uncertain_persistence_failure_leaves_the_attempt_claimed() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-
         let (store, scope) = state_store_with_session("worker-uncertain-persist-failure");
         let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
         store
             .enqueue_outbound_delivery(delivery.clone())
             .expect("delivery should enqueue");
         let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
-        let parent = store
-            .path()
-            .parent()
-            .expect("state path should have a parent")
-            .to_path_buf();
         let mut adapter = RecordingImAdapter {
             failure: Some(OutboundDeliveryFailure::uncertain(
                 "provider acceptance is unknown",
             )),
             state_check: Some(store.clone()),
-            lock_outcome_directory: Some(parent.clone()),
+            fail_before_replace_on_outcome: Some(store.path().to_path_buf()),
             ..RecordingImAdapter::default()
         };
         let mut times = [11, 12].into_iter();
@@ -829,8 +781,6 @@ mod tests {
         let result =
             worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
 
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("uncertain outcome persistence failure should be reported");
         assert_eq!(err.class(), ErrorClass::Recoverable);
         assert!(err.message().contains("uncertain outcome"));
@@ -846,7 +796,7 @@ mod tests {
             OutboundDeliveryStatus::Delivering
         );
 
-        adapter.lock_outcome_directory = None;
+        adapter.fail_before_replace_on_outcome = None;
         let idle = worker
             .process_next_with_clock(&mut adapter, || 13)
             .expect("unconfirmed uncertain delivery should not retry");
@@ -1084,8 +1034,7 @@ mod tests {
         attempts: Vec<OutboundDeliveryAttempt>,
         failure: Option<OutboundDeliveryFailure>,
         state_check: Option<StateStore>,
-        #[cfg(unix)]
-        lock_outcome_directory: Option<PathBuf>,
+        fail_before_replace_on_outcome: Option<PathBuf>,
         fail_after_replace_on_outcome: Option<PathBuf>,
     }
 
@@ -1128,19 +1077,12 @@ mod tests {
 
             self.attempts.push(attempt.clone());
 
-            if let Some(path) = &self.fail_after_replace_on_outcome {
-                fail_next_write_after_replace(path);
+            if let Some(path) = &self.fail_before_replace_on_outcome {
+                fail_next_write_before_replace(path);
             }
 
-            #[cfg(unix)]
-            if let Some(path) = &self.lock_outcome_directory {
-                use std::{fs, os::unix::fs::PermissionsExt};
-
-                fs::set_permissions(path, fs::Permissions::from_mode(0o500)).map_err(|err| {
-                    OutboundDeliveryFailure::retryable(format!(
-                        "failed to lock outcome directory: {err}"
-                    ))
-                })?;
+            if let Some(path) = &self.fail_after_replace_on_outcome {
+                fail_next_write_after_replace(path);
             }
 
             match &self.failure {

@@ -124,6 +124,7 @@ mod tests {
             OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
             OutboundDeliveryStatus,
         },
+        persistence::fail_next_write_before_replace,
         session::{Session, SessionId, SessionScope},
         state::RuntimeState,
     };
@@ -415,10 +416,7 @@ mod tests {
         assert_eq!(retry.delivery_attempts(), 2);
     }
     #[test]
-    #[cfg(unix)]
     fn state_store_does_not_return_claim_on_pre_replace_persist_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_path("state-outbound-delivery-claim-persist-failure");
         let path = dir.join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -432,13 +430,10 @@ mod tests {
         store
             .enqueue_outbound_delivery(delivery.clone())
             .expect("delivery should enqueue");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = store.claim_next_outbound_delivery(11);
 
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("failed claim persistence must not return a handoff");
         assert!(err.contains("failed to save runtime state"));
 
@@ -453,10 +448,7 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(unix)]
     fn state_store_does_not_return_delivered_on_pre_replace_persist_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_path("state-outbound-delivery-delivered-persist-failure");
         let path = dir.join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -473,13 +465,10 @@ mod tests {
         store
             .claim_next_outbound_delivery(11)
             .expect("delivery should claim");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = store.mark_outbound_delivery_delivered(delivery.id(), 12);
 
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("failed delivered persistence must not return an outcome");
         assert!(err.contains("failed to save runtime state"));
 
@@ -494,10 +483,7 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(unix)]
     fn state_store_does_not_return_failed_on_pre_replace_persist_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_path("state-outbound-delivery-failed-persist-failure");
         let path = dir.join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -514,13 +500,10 @@ mod tests {
         store
             .claim_next_outbound_delivery(11)
             .expect("delivery should claim");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = store.mark_outbound_delivery_failed(delivery.id(), 12, "transport failed");
 
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("failed failure persistence must not return an outcome");
         assert!(err.contains("failed to save runtime state"));
 
@@ -535,10 +518,7 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(unix)]
     fn state_store_does_not_return_uncertain_on_pre_replace_persist_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_path("state-outbound-delivery-uncertain-persist-failure");
         let path = dir.join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -554,8 +534,7 @@ mod tests {
         store
             .claim_next_outbound_delivery(11)
             .expect("delivery should claim");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = store.mark_outbound_delivery_uncertain(
             delivery.id(),
@@ -563,8 +542,6 @@ mod tests {
             "provider acceptance is unknown",
         );
 
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         result.expect_err("failed uncertain persistence must not return an outcome");
 
         let loaded = store.load().expect("state should still load");
@@ -728,10 +705,7 @@ mod tests {
         assert_eq!(loaded.outbound_delivery(delivery.id()), Some(&delivery));
     }
     #[test]
-    #[cfg(unix)]
     fn state_store_does_not_return_status_when_outbound_enqueue_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_path("state-outbound-delivery-persist-failure");
         let path = dir.join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -742,13 +716,10 @@ mod tests {
         initial.upsert_session(session);
 
         store.save(&initial).expect("initial state should save");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = store.enqueue_outbound_delivery(delivery);
 
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("failed persistence must not return a sendable status");
         assert!(err.contains("failed to save runtime state"));
 

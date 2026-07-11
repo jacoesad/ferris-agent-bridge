@@ -1,43 +1,30 @@
 use std::{
-    collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 
-static STATE_STORE_WRITE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
-    OnceLock::new();
+static STATE_STORE_WRITE_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
-pub(super) fn write_lock_for_path(path: &Path) -> Arc<Mutex<()>> {
-    let key = state_store_lock_key(path);
-    let registry = STATE_STORE_WRITE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut locks = match registry.lock() {
-        Ok(locks) => locks,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
-    lock
+pub(super) fn write_lock_for_path(_path: &Path) -> Arc<Mutex<()>> {
+    STATE_STORE_WRITE_LOCK
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 pub(super) fn state_store_lock_key(path: &Path) -> PathBuf {
-    if let Ok(canonical_path) = fs::canonicalize(path) {
-        return canonical_path;
-    }
+    let mut normalized = absolute_path(path);
 
-    if let Some(parent) = non_empty_parent(path) {
-        if let (Ok(canonical_parent), Some(file_name)) =
-            (fs::canonicalize(parent), path.file_name())
-        {
-            return canonical_parent.join(file_name);
+    loop {
+        let next = normalize_from_deepest_existing_ancestor(&normalized);
+        if next == normalized {
+            return next;
         }
+        normalized = next;
     }
+}
 
+fn absolute_path(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
@@ -49,9 +36,41 @@ pub(super) fn state_store_lock_key(path: &Path) -> PathBuf {
     })
 }
 
-fn non_empty_parent(path: &Path) -> Option<&Path> {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+fn normalize_from_deepest_existing_ancestor(path: &Path) -> PathBuf {
+    let mut ancestor = path.to_path_buf();
+
+    loop {
+        if let Ok(canonical_ancestor) = fs::canonicalize(&ancestor) {
+            let missing_tail = path.strip_prefix(&ancestor).unwrap_or(Path::new(""));
+            return normalize_lexically(&canonical_ancestor.join(missing_tail));
+        }
+
+        if !ancestor.pop() {
+            return normalize_lexically(path);
+        }
+    }
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
 }
 
 #[cfg(test)]
@@ -62,16 +81,76 @@ mod tests {
     };
 
     use super::super::StateStore;
+    use crate::runtime::state::RuntimeState;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn state_store_uses_same_process_write_lock_for_same_path() {
-        let path = test_path("state-same-path-lock").join("runtime.state.json");
-        let first = StateStore::new(&path);
-        let second = StateStore::new(&path);
+    fn state_store_serializes_writes_process_wide() {
+        let root = test_path("state-process-write-lock");
+        let first = StateStore::new(root.join("first.state.json"));
+        let second = StateStore::new(root.join("second.state.json"));
 
         assert!(first.shares_write_lock_with(&second));
+    }
+    #[test]
+    fn state_store_normalizes_missing_parent_traversal_for_io_and_locking() {
+        let root = test_path("state-missing-parent-alias");
+        let missing_parent = root.join("new");
+        let direct_path = missing_parent.join("runtime.state.json");
+        let alias_path = missing_parent
+            .join("..")
+            .join("new")
+            .join("runtime.state.json");
+        assert!(!missing_parent.exists());
+
+        let alias_store = StateStore::new(alias_path);
+        let direct_store = StateStore::new(direct_path);
+
+        assert_eq!(alias_store.path(), direct_store.path());
+        assert!(alias_store.shares_write_lock_with(&direct_store));
+        let expected = RuntimeState::new();
+        direct_store
+            .save(&expected)
+            .expect("direct path should save");
+        assert_eq!(
+            alias_store.load().expect("alias path should load"),
+            expected
+        );
+    }
+    #[test]
+    #[cfg(windows)]
+    fn state_store_serializes_case_variant_missing_windows_paths() {
+        let root = test_path("state-missing-parent-case-alias");
+        assert!(!root.join("New").exists());
+        let upper_store = StateStore::new(root.join("New").join("runtime.state.json"));
+        let lower_store = StateStore::new(root.join("new").join("runtime.state.json"));
+
+        assert!(upper_store.shares_write_lock_with(&lower_store));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn state_store_serializes_dangling_symlink_aliases_after_target_creation() {
+        let root = test_path("state-dangling-symlink-alias");
+        let target_parent = root.join("target");
+        let linked_parent = root.join("linked");
+        std::os::unix::fs::symlink(&target_parent, &linked_parent)
+            .expect("dangling parent symlink should be created");
+
+        let linked_store = StateStore::new(linked_parent.join("runtime.state.json"));
+        let direct_store = StateStore::new(target_parent.join("runtime.state.json"));
+
+        assert!(linked_store.shares_write_lock_with(&direct_store));
+        let expected = RuntimeState::new();
+        direct_store
+            .save(&expected)
+            .expect("direct path should create the symlink target");
+        assert_eq!(
+            linked_store
+                .load()
+                .expect("linked path should resolve after target creation"),
+            expected
+        );
     }
     #[test]
     #[cfg(unix)]
