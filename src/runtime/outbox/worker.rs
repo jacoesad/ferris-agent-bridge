@@ -171,7 +171,12 @@ fn unix_seconds_now() -> u64 {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
     };
 
     use crate::{
@@ -228,6 +233,73 @@ mod tests {
             .expect("delivery should remain stored");
         assert_eq!(stored.status(), OutboundDeliveryStatus::Delivered);
         assert_eq!(stored.delivered_at_unix(), Some(12));
+    }
+
+    #[test]
+    fn overlapping_workers_do_not_repeat_adapter_handoff() {
+        let (store, scope) = state_store_with_session("worker-overlapping-handoff");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let (delivery_started_tx, delivery_started_rx) = mpsc::sync_channel(0);
+        let (continue_delivery_tx, continue_delivery_rx) = mpsc::sync_channel(0);
+        let first_store = StateStore::new(store.path().to_path_buf());
+        let first_worker = thread::spawn(move || {
+            let worker = OutboxWorker::new(first_store, OutboundRetryPolicy::default());
+            let mut adapter = BlockingImAdapter {
+                delivery_started: delivery_started_tx,
+                continue_delivery: continue_delivery_rx,
+                attempts: 0,
+            };
+            let mut times = [11, 12].into_iter();
+            let outcome = worker
+                .process_next_with_clock(&mut adapter, || {
+                    times.next().expect("first worker clock value")
+                })
+                .expect("first worker should complete");
+            (outcome, adapter.attempts)
+        });
+
+        delivery_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first worker should reach adapter handoff");
+        let second_worker = OutboxWorker::new(
+            StateStore::new(store.path().to_path_buf()),
+            OutboundRetryPolicy::default(),
+        );
+        let mut second_adapter = RecordingImAdapter::default();
+        let second_outcome = second_worker
+            .process_next_with_clock(&mut second_adapter, || 11)
+            .expect("overlapping worker should remain idle");
+
+        assert_eq!(
+            second_outcome,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: None,
+            }
+        );
+        assert!(second_adapter.attempts.is_empty());
+        continue_delivery_tx
+            .send(())
+            .expect("first worker should still await release");
+        let (first_outcome, first_attempts) = first_worker
+            .join()
+            .expect("first worker thread should join");
+        assert_eq!(
+            first_outcome,
+            OutboxWorkerOutcome::Delivered {
+                delivery_id: delivery.id().clone(),
+                attempt_number: 1,
+            }
+        );
+        assert_eq!(first_attempts, 1);
+        let state = store.load().expect("state should load");
+        let stored = state
+            .outbound_delivery(delivery.id())
+            .expect("delivery should remain stored");
+        assert_eq!(stored.status(), OutboundDeliveryStatus::Delivered);
+        assert_eq!(stored.delivery_attempts(), 1);
     }
 
     #[test]
@@ -288,6 +360,49 @@ mod tests {
             }
         );
         assert_eq!(adapter.attempts.len(), 2);
+    }
+
+    #[test]
+    fn worker_defers_future_pending_delivery_until_its_timestamp() {
+        let (store, scope) = state_store_with_session("worker-future-pending");
+        let mut delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        delivery.touch_at(20);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let worker = OutboxWorker::new(store.clone(), OutboundRetryPolicy::default());
+        let mut adapter = RecordingImAdapter::default();
+
+        let deferred = worker
+            .process_next_with_clock(&mut adapter, || 19)
+            .expect("future delivery should remain idle");
+
+        assert_eq!(
+            deferred,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: Some(20),
+            }
+        );
+        assert!(adapter.attempts.is_empty());
+        let state = store.load().expect("state should load");
+        let stored = state
+            .outbound_delivery(delivery.id())
+            .expect("delivery should remain stored");
+        assert_eq!(stored.status(), OutboundDeliveryStatus::Pending);
+        assert_eq!(stored.delivery_attempts(), 0);
+
+        let mut due_times = [20, 21].into_iter();
+        let delivered = worker
+            .process_next_with_clock(&mut adapter, || due_times.next().expect("due clock value"))
+            .expect("delivery should run at its timestamp");
+        assert_eq!(
+            delivered,
+            OutboxWorkerOutcome::Delivered {
+                delivery_id: delivery.id().clone(),
+                attempt_number: 1,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
     }
 
     #[test]
@@ -824,6 +939,67 @@ mod tests {
     }
 
     #[test]
+    fn post_replace_retryable_failure_preserves_failed_state_and_backoff() {
+        let (store, scope) = state_store_with_session("worker-post-replace-retryable-failure");
+        let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
+        store
+            .enqueue_outbound_delivery(delivery.clone())
+            .expect("delivery should enqueue");
+        let policy = OutboundRetryPolicy::new(3, 10, 40).expect("valid retry policy");
+        let worker = OutboxWorker::new(store.clone(), policy);
+        let mut adapter = RecordingImAdapter {
+            failure: Some(OutboundDeliveryFailure::retryable(
+                "temporary transport failure",
+            )),
+            fail_after_replace_on_outcome: Some(store.path().to_path_buf()),
+            ..RecordingImAdapter::default()
+        };
+        let mut times = [11, 12].into_iter();
+
+        let result =
+            worker.process_next_with_clock(&mut adapter, || times.next().expect("clock value"));
+
+        let err = result.expect_err("post-replace retryable failure should be reported");
+        assert!(err.message().contains("reload persisted state"));
+        assert_eq!(adapter.attempts.len(), 1);
+        let state = store.load().expect("updated state should remain readable");
+        let stored = state
+            .outbound_delivery(delivery.id())
+            .expect("delivery should remain stored");
+        assert_eq!(stored.status(), OutboundDeliveryStatus::Failed);
+        assert_eq!(stored.delivery_attempts(), 1);
+        assert_eq!(stored.last_error(), Some("temporary transport failure"));
+
+        adapter.fail_after_replace_on_outcome = None;
+        let deferred = worker
+            .process_next_with_clock(&mut adapter, || 21)
+            .expect("failed record should respect backoff");
+        assert_eq!(
+            deferred,
+            OutboxWorkerOutcome::Idle {
+                next_attempt_at_unix: Some(22),
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 1);
+
+        adapter.failure = None;
+        let mut retry_times = [22, 23].into_iter();
+        let delivered = worker
+            .process_next_with_clock(&mut adapter, || {
+                retry_times.next().expect("retry clock value")
+            })
+            .expect("failed record should retry when due");
+        assert_eq!(
+            delivered,
+            OutboxWorkerOutcome::Delivered {
+                delivery_id: delivery.id().clone(),
+                attempt_number: 2,
+            }
+        );
+        assert_eq!(adapter.attempts.len(), 2);
+    }
+
+    #[test]
     fn post_replace_uncertain_failure_keeps_the_delivery_non_retryable() {
         let (store, scope) = state_store_with_session("worker-post-replace-uncertain-failure");
         let delivery = outbound_delivery_fixture("out_1", SessionId::for_scope(&scope), 10);
@@ -866,6 +1042,41 @@ mod tests {
             }
         );
         assert_eq!(adapter.attempts.len(), 1);
+    }
+
+    struct BlockingImAdapter {
+        delivery_started: mpsc::SyncSender<()>,
+        continue_delivery: mpsc::Receiver<()>,
+        attempts: usize,
+    }
+
+    impl ImAdapter for BlockingImAdapter {
+        fn acknowledge_inbound_delivery(
+            &mut self,
+            _acknowledgement: &InboundDeliveryAcknowledgement,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn deliver_outbound_message(
+            &mut self,
+            _attempt: &OutboundDeliveryAttempt,
+        ) -> Result<(), OutboundDeliveryFailure> {
+            self.attempts += 1;
+            self.delivery_started.send(()).map_err(|err| {
+                OutboundDeliveryFailure::retryable(format!(
+                    "failed to report blocked adapter handoff: {err}"
+                ))
+            })?;
+            self.continue_delivery
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|err| {
+                    OutboundDeliveryFailure::retryable(format!(
+                        "failed to release blocked adapter handoff: {err}"
+                    ))
+                })?;
+            Ok(())
+        }
     }
 
     #[derive(Default)]
