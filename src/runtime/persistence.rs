@@ -238,11 +238,13 @@ fn set_private_file_permissions(_file: &File) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    #[cfg(unix)]
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     #[test]
@@ -267,6 +269,7 @@ mod tests {
         assert!(super::non_empty_parent(std::path::Path::new("runtime.state.json")).is_none());
     }
 
+    #[cfg(unix)]
     fn test_path(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "ferris-agent-bridge-{name}-{}-{}",
