@@ -831,6 +831,52 @@ mod tests {
         assert!(err.contains("does not match run created_at_unix"));
     }
     #[test]
+    fn state_validation_rejects_claim_that_skips_the_session_queue_prefix() {
+        let (path, mut encoded) = partially_claimed_state_fixture("run-input-skipped-prefix");
+        let claimed_message = encoded["run_inputs"][0]["messages"][0].clone();
+        let queued_message = encoded["queued_messages"][0].clone();
+        let later_enqueued_at = queued_message["enqueued_at_unix"]
+            .as_u64()
+            .expect("enqueue time should be an integer");
+        let claimed_at = encoded["run_inputs"][0]["claimed_at_unix"]
+            .as_u64()
+            .expect("claim time should be an integer")
+            .max(later_enqueued_at);
+        encoded["run_inputs"][0]["messages"][0] = queued_message;
+        encoded["run_inputs"][0]["ready_at_unix"] = serde_json::json!(later_enqueued_at);
+        encoded["run_inputs"][0]["claimed_at_unix"] = serde_json::json!(claimed_at);
+        encoded["runs"][0]["created_at_unix"] = serde_json::json!(claimed_at);
+        encoded["runs"][0]["updated_at_unix"] = serde_json::json!(claimed_at);
+        encoded["queued_messages"][0] = claimed_message;
+        let updated_at = encoded["updated_at_unix"]
+            .as_u64()
+            .expect("state update time should be an integer")
+            .max(claimed_at);
+        encoded["updated_at_unix"] = serde_json::json!(updated_at);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("claimed work must be a prefix of its session queue");
+
+        assert!(err.contains("is before already claimed work"));
+    }
+    #[test]
+    fn state_validation_rejects_reordered_run_input_batches_for_a_session() {
+        let (path, mut encoded) = two_claimed_inputs_fixture("run-input-batch-order");
+        encoded["run_inputs"]
+            .as_array_mut()
+            .expect("run inputs should be an array")
+            .swap(0, 1);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("run input history must retain session claim order");
+
+        assert!(err.contains("out of session ownership order"));
+    }
+    #[test]
     fn state_validation_rejects_duplicate_outbound_delivery_ids() {
         let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
         let session = session_fixture(&scope, 1, 1);
@@ -1044,6 +1090,49 @@ mod tests {
         let encoded =
             serde_json::from_slice(&fs::read(&path).expect("claimed state fixture should read"))
                 .expect("claimed state fixture should decode");
+        (path, encoded)
+    }
+    fn partially_claimed_state_fixture(name: &str) -> (std::path::PathBuf, serde_json::Value) {
+        let (path, encoded) = queued_state_fixture(name, 2);
+        let store = StateStore::new(&path);
+        let queued_at = encoded["queued_messages"][0]["enqueued_at_unix"]
+            .as_u64()
+            .expect("enqueue time should be an integer");
+        store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect("first message should claim");
+        let encoded =
+            serde_json::from_slice(&fs::read(&path).expect("partial claim fixture should read"))
+                .expect("partial claim fixture should decode");
+        (path, encoded)
+    }
+    fn two_claimed_inputs_fixture(name: &str) -> (std::path::PathBuf, serde_json::Value) {
+        let (path, first_claim) = partially_claimed_state_fixture(name);
+        let store = StateStore::new(&path);
+        let first_run_id = RunId::new("run_1").expect("valid run id");
+        let first_claimed_at = first_claim["run_inputs"][0]["claimed_at_unix"]
+            .as_u64()
+            .expect("claim time should be an integer");
+        let mut state = store.load().expect("first claim should load");
+        state
+            .fail_run(&first_run_id, first_claimed_at)
+            .expect("first run should become terminal");
+        store.save(&state).expect("terminal run should persist");
+        let queued_at = state.queued_messages()[0].enqueued_at_unix();
+        store
+            .claim_message_batch(
+                RunId::new("run_2").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at.max(first_claimed_at),
+            )
+            .expect("second message should claim");
+        let encoded =
+            serde_json::from_slice(&fs::read(&path).expect("two-claim fixture should read"))
+                .expect("two-claim fixture should decode");
         (path, encoded)
     }
     fn write_state_fixture(path: &std::path::Path, encoded: &serde_json::Value) {

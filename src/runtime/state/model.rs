@@ -514,6 +514,7 @@ impl RuntimeState {
         }
 
         let mut claimed_event_ids = BTreeSet::new();
+        let mut last_owned_inbound_position_by_session = BTreeMap::new();
         for input in &self.run_inputs {
             input.validate()?;
             if !run_input_ids.insert(input.run_id()) {
@@ -537,7 +538,6 @@ impl RuntimeState {
                 ));
             }
 
-            let mut previous_inbound_position = None;
             for message in input.messages() {
                 if queued_event_ids.contains(message.event_id()) {
                     return Err(format!(
@@ -577,15 +577,17 @@ impl RuntimeState {
                         message.event_id()
                     ));
                 }
-                if let Some(previous_position) = previous_inbound_position {
+                if let Some(previous_position) = last_owned_inbound_position_by_session
+                    .insert(input.session_id(), inbound_position)
+                {
                     if inbound_position <= previous_position {
                         return Err(format!(
-                            "run input {} messages are out of inbound ledger order",
-                            input.run_id()
+                            "run input {} message event {} is out of session ownership order",
+                            input.run_id(),
+                            message.event_id()
                         ));
                     }
                 }
-                previous_inbound_position = Some(inbound_position);
             }
 
             if self.updated_at_unix < input.claimed_at_unix() {
@@ -593,6 +595,23 @@ impl RuntimeState {
                     "runtime state updated_at_unix before run input {} claimed_at_unix",
                     input.run_id()
                 ));
+            }
+        }
+
+        for queued in &self.queued_messages {
+            let inbound_position = *inbound_event_positions
+                .get(queued.event_id())
+                .expect("queued messages were validated against the inbound ledger");
+            if let Some(previous_position) =
+                last_owned_inbound_position_by_session.insert(queued.session_id(), inbound_position)
+            {
+                if inbound_position <= previous_position {
+                    return Err(format!(
+                        "queued message event {} is before already claimed work for session {}",
+                        queued.event_id(),
+                        queued.session_id()
+                    ));
+                }
             }
         }
 
