@@ -862,6 +862,29 @@ mod tests {
         assert!(err.contains("is before already claimed work"));
     }
     #[test]
+    fn state_validation_rejects_queue_time_before_claimed_tail() {
+        let (path, mut encoded) =
+            partially_claimed_state_fixture("run-input-queue-time-regression");
+        let queued_enqueued_at = encoded["queued_messages"][0]["enqueued_at_unix"]
+            .as_u64()
+            .expect("queued enqueue time should be an integer");
+        let claimed_tail = queued_enqueued_at + 1;
+        encoded["run_inputs"][0]["messages"][0]["enqueued_at_unix"] =
+            serde_json::json!(claimed_tail);
+        encoded["run_inputs"][0]["ready_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["run_inputs"][0]["claimed_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["runs"][0]["created_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["runs"][0]["updated_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["updated_at_unix"] = serde_json::json!(claimed_tail);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("queued work must not predate its claimed ownership prefix");
+
+        assert!(err.contains("before already claimed enqueue time"));
+    }
+    #[test]
     fn state_validation_rejects_reordered_run_input_batches_for_a_session() {
         let (path, mut encoded) = two_claimed_inputs_fixture("run-input-batch-order");
         encoded["run_inputs"]

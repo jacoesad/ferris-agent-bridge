@@ -360,6 +360,7 @@ impl RuntimeState {
         let mut queued_event_ids = BTreeSet::new();
         let mut last_queued_at_by_session = BTreeMap::new();
         let mut last_queued_inbound_position = None;
+        let mut last_owned_enqueued_at_by_session = BTreeMap::new();
         let mut outbound_delivery_ids = BTreeSet::new();
 
         for session in &self.sessions {
@@ -577,6 +578,17 @@ impl RuntimeState {
                         message.event_id()
                     ));
                 }
+                if let Some(previous_enqueued_at) = last_owned_enqueued_at_by_session
+                    .insert(input.session_id(), message.enqueued_at_unix())
+                {
+                    if message.enqueued_at_unix() < previous_enqueued_at {
+                        return Err(format!(
+                            "run input {} message event {} is out of session enqueue order",
+                            input.run_id(),
+                            message.event_id()
+                        ));
+                    }
+                }
                 if let Some(previous_position) = last_owned_inbound_position_by_session
                     .insert(input.session_id(), inbound_position)
                 {
@@ -599,6 +611,17 @@ impl RuntimeState {
         }
 
         for queued in &self.queued_messages {
+            if let Some(previous_enqueued_at) = last_owned_enqueued_at_by_session
+                .insert(queued.session_id(), queued.enqueued_at_unix())
+            {
+                if queued.enqueued_at_unix() < previous_enqueued_at {
+                    return Err(format!(
+                        "queued message event {} is before already claimed enqueue time for session {}",
+                        queued.event_id(),
+                        queued.session_id()
+                    ));
+                }
+            }
             let inbound_position = *inbound_event_positions
                 .get(queued.event_id())
                 .expect("queued messages were validated against the inbound ledger");
@@ -750,11 +773,17 @@ impl RuntimeState {
             ));
         }
         let previous_enqueued_at = self
-            .queued_messages
+            .run_inputs
             .iter()
-            .rev()
-            .find(|queued| queued.session_id() == session_id)
+            .filter(|input| input.session_id() == session_id)
+            .flat_map(|input| input.messages())
+            .chain(
+                self.queued_messages
+                    .iter()
+                    .filter(|queued| queued.session_id() == session_id),
+            )
             .map(QueuedMessage::enqueued_at_unix)
+            .max()
             .unwrap_or(0);
 
         QueuedMessage::from_event(event, recorded_at_unix.max(previous_enqueued_at)).map(Some)
@@ -954,9 +983,15 @@ impl RuntimeState {
                 None => merged.push(existing_queued.clone()),
             }
         }
-        let mut last_queued_at_by_session = BTreeMap::new();
+        let mut last_owned_enqueued_at_by_session = BTreeMap::new();
+        for input in &self.run_inputs {
+            for message in input.messages() {
+                last_owned_enqueued_at_by_session
+                    .insert(input.session_id().clone(), message.enqueued_at_unix());
+            }
+        }
         for queued in &merged {
-            last_queued_at_by_session
+            last_owned_enqueued_at_by_session
                 .insert(queued.session_id().clone(), queued.enqueued_at_unix());
         }
         for candidate_queued in &self.queued_messages {
@@ -985,11 +1020,11 @@ impl RuntimeState {
                 None => {
                     let mut candidate_queued = candidate_queued.clone();
                     if let Some(previous_enqueued_at) =
-                        last_queued_at_by_session.get(candidate_queued.session_id())
+                        last_owned_enqueued_at_by_session.get(candidate_queued.session_id())
                     {
                         candidate_queued.rebase_enqueued_at_unix(*previous_enqueued_at);
                     }
-                    last_queued_at_by_session.insert(
+                    last_owned_enqueued_at_by_session.insert(
                         candidate_queued.session_id().clone(),
                         candidate_queued.enqueued_at_unix(),
                     );

@@ -925,6 +925,100 @@ mod tests {
     }
 
     #[test]
+    fn stale_snapshot_rebases_candidate_enqueue_time_after_claimed_tail() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let (store, session_id) =
+            state_store_with_session("queue-stale-rebase-after-claim", "chat:a");
+        let mut stale_snapshot = store.load().expect("state should load");
+        let candidate_event =
+            message_event("evt_candidate", "msg_candidate", &session_id, FUTURE_UNIX);
+        let durable_event =
+            message_event("evt_durable", "msg_durable", &session_id, FUTURE_UNIX + 10);
+        stale_snapshot
+            .record_inbound_event(&candidate_event)
+            .expect("candidate message should record at the earlier time");
+        store
+            .persist_inbound_event(&durable_event)
+            .expect("newer durable message should persist first");
+        let run_id = RunId::new("run_1").expect("valid run id");
+        store
+            .claim_message_batch(
+                run_id.clone(),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                FUTURE_UNIX + 10,
+            )
+            .expect("durable message should claim");
+
+        store
+            .save(&stale_snapshot)
+            .expect("stale candidate should rebase after the claimed input tail");
+
+        let mut state = store.load().expect("state should load");
+        assert_eq!(
+            state
+                .run_input(&run_id)
+                .expect("run input should exist")
+                .messages()[0]
+                .enqueued_at_unix(),
+            FUTURE_UNIX + 10
+        );
+        assert_eq!(state.queued_messages()[0].event_id(), &candidate_event.id);
+        assert_eq!(
+            state.queued_messages()[0].enqueued_at_unix(),
+            FUTURE_UNIX + 10
+        );
+
+        state
+            .fail_run(&run_id, FUTURE_UNIX + 11)
+            .expect("run should become terminal");
+        store.save(&state).expect("terminal run should persist");
+        let MessageQueuePoll::Waiting { next_ready_at_unix } = store
+            .poll_message_queue(
+                &MessageQueuePolicy::new(60, 2).expect("valid policy"),
+                FUTURE_UNIX + 60,
+            )
+            .expect("queue should poll")
+        else {
+            panic!("rebased candidate must still be waiting for debounce");
+        };
+        assert_eq!(next_ready_at_unix, Some(FUTURE_UNIX + 70));
+    }
+
+    #[test]
+    fn inbound_message_after_claim_rebases_to_claimed_tail() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let (store, session_id) =
+            state_store_with_session("queue-inbound-rebase-after-claim", "chat:a");
+        let durable_event =
+            message_event("evt_durable", "msg_durable", &session_id, FUTURE_UNIX + 10);
+        store
+            .persist_inbound_event(&durable_event)
+            .expect("durable message should persist");
+        store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                FUTURE_UNIX + 10,
+            )
+            .expect("durable message should claim");
+
+        let candidate_event =
+            message_event("evt_candidate", "msg_candidate", &session_id, FUTURE_UNIX);
+        store
+            .persist_inbound_event(&candidate_event)
+            .expect("candidate message should persist after the claim");
+
+        let state = store.load().expect("state should load");
+        assert_eq!(state.queued_messages()[0].event_id(), &candidate_event.id);
+        assert_eq!(
+            state.queued_messages()[0].enqueued_at_unix(),
+            FUTURE_UNIX + 10
+        );
+    }
+
+    #[test]
     fn stale_snapshot_without_queue_session_fails_closed() {
         let path = test_path("queue-stale-save-missing-session").join("runtime.state.json");
         let stale_writer = StateStore::new(&path);
