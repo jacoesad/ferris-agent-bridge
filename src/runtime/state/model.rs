@@ -66,6 +66,18 @@ impl RuntimeState {
             return Err(format!("duplicate run id {}", run.id()));
         }
 
+        if !run.is_terminal() {
+            if let Some(existing) = self.runs.iter().find(|existing| {
+                existing.session_id() == run.session_id() && !existing.is_terminal()
+            }) {
+                return Err(format!(
+                    "session {} already has active run {}",
+                    run.session_id(),
+                    existing.id()
+                ));
+            }
+        }
+
         let updated_at_unix = run.updated_at_unix();
         self.runs.push(run);
         self.touch_at(updated_at_unix.max(unix_seconds_now()));
@@ -279,6 +291,7 @@ impl RuntimeState {
     pub fn validate(&self) -> Result<(), String> {
         let mut session_ids = BTreeSet::new();
         let mut run_ids = BTreeSet::new();
+        let mut active_run_by_session = BTreeMap::new();
         let mut inbound_event_positions = BTreeMap::new();
         let mut queued_event_ids = BTreeSet::new();
         let mut last_queued_at_by_session = BTreeMap::new();
@@ -306,6 +319,19 @@ impl RuntimeState {
 
             if !run_ids.insert(run.id()) {
                 return Err(format!("duplicate run id {}", run.id()));
+            }
+
+            if !run.is_terminal() {
+                if let Some(existing_run_id) =
+                    active_run_by_session.insert(run.session_id(), run.id())
+                {
+                    return Err(format!(
+                        "session {} has multiple active runs {} and {}",
+                        run.session_id(),
+                        existing_run_id,
+                        run.id()
+                    ));
+                }
             }
 
             if self.updated_at_unix < run.updated_at_unix() {
@@ -675,6 +701,29 @@ impl RuntimeState {
             self.touch_at(event.recorded_at_unix());
         }
         self.inbound_events = merged;
+
+        Ok(())
+    }
+
+    pub(super) fn preserve_runs_from(&mut self, existing: &RuntimeState) -> Result<(), String> {
+        let mut merged = existing.runs.clone();
+        for candidate_run in &self.runs {
+            match merged.iter_mut().find(|run| run.id() == candidate_run.id()) {
+                Some(existing_run) if existing_run == candidate_run => {}
+                Some(existing_run) if candidate_run.is_descendant_of(existing_run) => {
+                    *existing_run = candidate_run.clone();
+                }
+                Some(existing_run) if existing_run.is_descendant_of(candidate_run) => {}
+                Some(_) => {
+                    return Err(format!("conflicting run record {}", candidate_run.id()));
+                }
+                None => merged.push(candidate_run.clone()),
+            }
+        }
+        for run in &merged {
+            self.touch_at(run.updated_at_unix());
+        }
+        self.runs = merged;
 
         Ok(())
     }
@@ -1145,6 +1194,48 @@ mod tests {
             .start_run(&run_id, 13)
             .expect_err("terminal run should not restart");
         assert!(err.contains("cannot start from Completed"));
+    }
+    #[test]
+    fn state_allows_only_one_active_run_per_session() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let first_id = RunId::new("run_1").expect("valid run id");
+        let second_id = RunId::new("run_2").expect("valid run id");
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state
+            .add_run(RunRecord::new(first_id.clone(), session_id.clone(), 10))
+            .expect("first active run should be accepted");
+
+        let err = state
+            .add_run(RunRecord::new(second_id.clone(), session_id.clone(), 11))
+            .expect_err("second active run in the same session must be rejected");
+        assert!(err.contains("already has active run"));
+        assert!(err.contains(first_id.as_str()));
+
+        state
+            .fail_run(&first_id, 12)
+            .expect("terminal run should release the session");
+        state
+            .add_run(RunRecord::new(second_id, session_id, 13))
+            .expect("terminal history must not block a new active run");
+    }
+    #[test]
+    fn state_validation_rejects_multiple_active_runs_for_a_session() {
+        let (mut state, _) = state_with_pending_run("run_1");
+        let session_id = state.sessions()[0].id().clone();
+        state.runs.push(RunRecord::new(
+            RunId::new("run_2").expect("valid run id"),
+            session_id,
+            11,
+        ));
+
+        let err = state
+            .validate()
+            .expect_err("persisted state must reject multiple active runs per session");
+
+        assert!(err.contains("multiple active runs"));
     }
     #[test]
     fn upsert_session_preserves_created_at_for_existing_session() {

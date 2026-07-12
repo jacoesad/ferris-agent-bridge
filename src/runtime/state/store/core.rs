@@ -69,6 +69,7 @@ impl StateStore {
 
         if let Some(existing) = existing {
             state.validate_shared_inbound_event_identity(&existing)?;
+            state.preserve_runs_from(&existing)?;
             state.preserve_inbound_events_from(&existing)?;
             state.preserve_queued_messages_from(&existing)?;
             state.preserve_outbound_deliveries_from(&existing)?;
@@ -143,7 +144,11 @@ fn validate_snapshot_outbound_additions(
 mod tests {
     use std::{
         fs,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
+        thread,
     };
 
     use super::StateStore;
@@ -200,6 +205,125 @@ mod tests {
             RunStatus::Completed
         );
         assert_eq!(loaded, state);
+    }
+    #[test]
+    fn state_store_preserves_newer_run_transitions_from_stale_saves() {
+        let path = test_path("state-stale-run-transition").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let session_id = session.id().clone();
+        let run_id = RunId::new("run_1").expect("valid run id");
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+        initial
+            .add_run(RunRecord::new(run_id.clone(), session_id, 10))
+            .expect("pending run should be accepted");
+        store.save(&initial).expect("initial state should save");
+        let stale = store.load().expect("stale state should load");
+        let mut current = store.load().expect("current state should load");
+        current.start_run(&run_id, 11).expect("run should start");
+        store
+            .save(&current)
+            .expect("forward run transition should save");
+
+        store
+            .save(&stale)
+            .expect("stale pending snapshot should preserve durable running state");
+
+        assert_eq!(
+            store
+                .load()
+                .expect("state should load")
+                .run(&run_id)
+                .expect("run should remain durable")
+                .status(),
+            RunStatus::Running
+        );
+    }
+    #[test]
+    fn state_store_stale_save_rejects_divergent_run_outcomes() {
+        let path = test_path("state-divergent-run-outcomes").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let session_id = session.id().clone();
+        let run_id = RunId::new("run_1").expect("valid run id");
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+        initial
+            .add_run(RunRecord::new(run_id.clone(), session_id, 10))
+            .expect("pending run should be accepted");
+        store.save(&initial).expect("initial state should save");
+        let mut failed = store.load().expect("failed writer should load");
+        let mut cancelled = store.load().expect("cancelled writer should load");
+        failed.fail_run(&run_id, 11).expect("run should fail");
+        cancelled
+            .cancel_run(&run_id, 11)
+            .expect("run should cancel");
+        store.save(&failed).expect("failed outcome should save");
+
+        let err = store
+            .save(&cancelled)
+            .expect_err("divergent terminal outcome must fail closed");
+
+        assert!(err.contains("conflicting run record"));
+        assert_eq!(
+            store
+                .load()
+                .expect("state should remain readable")
+                .run(&run_id)
+                .expect("run should remain durable")
+                .status(),
+            RunStatus::Failed
+        );
+    }
+    #[test]
+    fn concurrent_stale_saves_create_only_one_active_run_per_session() {
+        let path = test_path("state-concurrent-active-runs").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let session_id = session.id().clone();
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+        store.save(&initial).expect("initial state should save");
+        let mut first = store.load().expect("first writer should load");
+        let mut second = store.load().expect("second writer should load");
+        first
+            .add_run(RunRecord::new(
+                RunId::new("run_1").expect("valid run id"),
+                session_id.clone(),
+                10,
+            ))
+            .expect("first candidate run should be valid");
+        second
+            .add_run(RunRecord::new(
+                RunId::new("run_2").expect("valid run id"),
+                session_id,
+                10,
+            ))
+            .expect("second candidate run should be valid");
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [first, second].map(|state| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.save(&state)
+            })
+        });
+        barrier.wait();
+
+        let results = handles.map(|handle| handle.join().expect("writer should not panic"));
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let loaded = store.load().expect("state should load");
+        assert_eq!(
+            loaded
+                .runs()
+                .iter()
+                .filter(|run| !run.is_terminal())
+                .count(),
+            1
+        );
     }
     #[test]
     fn state_store_save_fails_closed_when_existing_state_is_invalid() {
