@@ -1,3 +1,17 @@
+use crate::runtime::queue::{MessageQueuePolicy, MessageQueuePoll};
+
+use super::StateStore;
+
+impl StateStore {
+    pub fn poll_message_queue(
+        &self,
+        policy: &MessageQueuePolicy,
+        now_unix: u64,
+    ) -> Result<MessageQueuePoll, String> {
+        Ok(self.load()?.poll_message_queue(policy, now_unix))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -13,6 +27,7 @@ mod tests {
         event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
         message::{Message, MessageAuthor, MessageContent, MessageId},
         persistence::fail_next_write_before_replace,
+        queue::{MessageQueuePolicy, MessageQueuePoll},
         session::{Session, SessionId, SessionScope},
         state::RuntimeState,
     };
@@ -234,6 +249,218 @@ mod tests {
     }
 
     #[test]
+    fn message_queue_waits_for_debounce_without_consuming_ready_batches() {
+        let (store, session_id) = state_store_with_session("queue-debounce", "chat:a");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, 10))
+            .expect("message should persist");
+        let queued_at =
+            store.load().expect("state should load").queued_messages()[0].enqueued_at_unix();
+        let policy = MessageQueuePolicy::new(5, 10).expect("valid policy");
+
+        assert_eq!(
+            store
+                .poll_message_queue(&policy, queued_at + 4)
+                .expect("queue should poll"),
+            MessageQueuePoll::Waiting {
+                next_ready_at_unix: Some(queued_at + 5),
+            }
+        );
+        let first = store
+            .poll_message_queue(&policy, queued_at + 5)
+            .expect("queue should become ready");
+        let second = store
+            .poll_message_queue(&policy, queued_at + 5)
+            .expect("polling must not consume the batch");
+
+        assert_eq!(first, second);
+        let MessageQueuePoll::Ready(batch) = first else {
+            panic!("message batch should be ready");
+        };
+        assert_eq!(batch.session_id(), &session_id);
+        assert_eq!(batch.messages().len(), 1);
+        assert_eq!(batch.ready_at_unix(), queued_at + 5);
+    }
+
+    #[test]
+    fn full_batch_is_ready_without_waiting_and_scopes_remain_isolated() {
+        let path = test_path("queue-full-batch").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let first_session = Session::new(SessionScope::new("lark", "chat:a").expect("valid scope"));
+        let second_session =
+            Session::new(SessionScope::new("lark", "chat:b").expect("valid scope"));
+        let first_session_id = first_session.id().clone();
+        let second_session_id = second_session.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(first_session);
+        state.upsert_session(second_session);
+        store.save(&state).expect("sessions should persist");
+        store
+            .persist_inbound_event(&message_event("evt_a1", "msg_a1", &first_session_id, 10))
+            .expect("first scope message should persist");
+        store
+            .persist_inbound_event(&message_event("evt_b1", "msg_b1", &second_session_id, 11))
+            .expect("second scope message should persist");
+        store
+            .persist_inbound_event(&message_event("evt_a2", "msg_a2", &first_session_id, 12))
+            .expect("second first-scope message should persist");
+        let state = store.load().expect("state should load");
+        let now = state.updated_at_unix();
+        let policy = MessageQueuePolicy::new(60, 2).expect("valid policy");
+
+        let MessageQueuePoll::Ready(batch) = store
+            .poll_message_queue(&policy, now)
+            .expect("queue should poll")
+        else {
+            panic!("full batch should be ready immediately");
+        };
+
+        assert_eq!(batch.session_id(), &first_session_id);
+        assert_eq!(batch.messages().len(), 2);
+        assert_eq!(batch.messages()[0].message().id.as_str(), "msg_a1");
+        assert_eq!(batch.messages()[1].message().id.as_str(), "msg_a2");
+    }
+
+    #[test]
+    fn equally_ready_scopes_use_stable_session_order() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let path = test_path("queue-ready-tie").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let first_session = Session::new(SessionScope::new("lark", "chat:a").expect("valid scope"));
+        let second_session =
+            Session::new(SessionScope::new("lark", "chat:b").expect("valid scope"));
+        let first_session_id = first_session.id().clone();
+        let second_session_id = second_session.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(first_session);
+        state.upsert_session(second_session);
+        store.save(&state).expect("sessions should persist");
+
+        let first_event = message_event("evt_first", "msg_first", &first_session_id, FUTURE_UNIX);
+        let second_event =
+            message_event("evt_second", "msg_second", &second_session_id, FUTURE_UNIX);
+        let expected_session_id = if first_session_id < second_session_id {
+            store
+                .persist_inbound_event(&second_event)
+                .expect("larger session should persist first");
+            store
+                .persist_inbound_event(&first_event)
+                .expect("smaller session should persist second");
+            first_session_id
+        } else {
+            store
+                .persist_inbound_event(&first_event)
+                .expect("larger session should persist first");
+            store
+                .persist_inbound_event(&second_event)
+                .expect("smaller session should persist second");
+            second_session_id
+        };
+        let policy = MessageQueuePolicy::new(5, 10).expect("valid policy");
+
+        let MessageQueuePoll::Ready(batch) = store
+            .poll_message_queue(&policy, FUTURE_UNIX + 5)
+            .expect("queue should poll")
+        else {
+            panic!("one tied scope should be ready");
+        };
+
+        assert_eq!(batch.session_id(), &expected_session_id);
+        assert_eq!(batch.ready_at_unix(), FUTURE_UNIX + 5);
+    }
+
+    #[test]
+    fn partial_batch_debounce_resets_after_the_last_message() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let (store, session_id) = state_store_with_session("queue-debounce-reset", "chat:active");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, FUTURE_UNIX))
+            .expect("first message should persist");
+        store
+            .persist_inbound_event(&message_event(
+                "evt_2",
+                "msg_2",
+                &session_id,
+                FUTURE_UNIX + 3,
+            ))
+            .expect("second message should persist");
+        let policy = MessageQueuePolicy::new(5, 10).expect("valid policy");
+
+        assert_eq!(
+            store
+                .poll_message_queue(&policy, FUTURE_UNIX + 7)
+                .expect("queue should poll"),
+            MessageQueuePoll::Waiting {
+                next_ready_at_unix: Some(FUTURE_UNIX + 8),
+            }
+        );
+        let MessageQueuePoll::Ready(batch) = store
+            .poll_message_queue(&policy, FUTURE_UNIX + 8)
+            .expect("queue should poll")
+        else {
+            panic!("batch should become ready after the last message debounce");
+        };
+        assert_eq!(batch.messages().len(), 2);
+        assert_eq!(batch.ready_at_unix(), FUTURE_UNIX + 8);
+    }
+
+    #[test]
+    fn partial_batch_debounce_resets_only_its_own_scope() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let path = test_path("queue-debounce-scope-isolation").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let quiet_session =
+            Session::new(SessionScope::new("lark", "chat:quiet").expect("valid scope"));
+        let active_session =
+            Session::new(SessionScope::new("lark", "chat:active").expect("valid scope"));
+        let quiet_session_id = quiet_session.id().clone();
+        let active_session_id = active_session.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(quiet_session);
+        state.upsert_session(active_session);
+        store.save(&state).expect("sessions should persist");
+        store
+            .persist_inbound_event(&message_event(
+                "evt_quiet",
+                "msg_quiet",
+                &quiet_session_id,
+                FUTURE_UNIX,
+            ))
+            .expect("quiet-scope message should persist");
+        store
+            .persist_inbound_event(&message_event(
+                "evt_active_1",
+                "msg_active_1",
+                &active_session_id,
+                FUTURE_UNIX,
+            ))
+            .expect("first active-scope message should persist");
+        store
+            .persist_inbound_event(&message_event(
+                "evt_active_2",
+                "msg_active_2",
+                &active_session_id,
+                FUTURE_UNIX + 3,
+            ))
+            .expect("second active-scope message should persist");
+        let policy = MessageQueuePolicy::new(5, 10).expect("valid policy");
+
+        let MessageQueuePoll::Ready(batch) = store
+            .poll_message_queue(&policy, FUTURE_UNIX + 5)
+            .expect("queue should poll")
+        else {
+            panic!("quiet scope should be ready independently");
+        };
+
+        assert_eq!(batch.session_id(), &quiet_session_id);
+        assert_eq!(batch.ready_at_unix(), FUTURE_UNIX + 5);
+        assert_eq!(batch.messages().len(), 1);
+    }
+
+    #[test]
     fn stale_snapshot_save_preserves_durably_queued_messages() {
         let (store, session_id) = state_store_with_session("queue-stale-save", "chat:a");
         let stale_snapshot = store.load().expect("state should load");
@@ -285,6 +512,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(inbound_ids, ["evt_durable", "evt_candidate"]);
         assert_eq!(queued_ids, ["evt_durable", "evt_candidate"]);
+
+        let policy = MessageQueuePolicy::new(60, 2).expect("valid policy");
+        let MessageQueuePoll::Ready(batch) = state.poll_message_queue(&policy, FUTURE_UNIX) else {
+            panic!("full batch should be ready");
+        };
+        let batch_ids = batch
+            .messages()
+            .iter()
+            .map(|queued| queued.event_id().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(batch_ids, ["evt_durable", "evt_candidate"]);
     }
 
     #[test]

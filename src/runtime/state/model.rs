@@ -11,7 +11,7 @@ use crate::runtime::{
         OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
         OutboundDeliveryStatus,
     },
-    queue::QueuedMessage,
+    queue::{MessageQueuePolicy, MessageQueuePoll, QueuedMessage},
     run::{RunId, RunRecord},
     session::{Session, SessionId},
 };
@@ -93,6 +93,14 @@ impl RuntimeState {
 
     pub fn queued_messages(&self) -> &[QueuedMessage] {
         &self.queued_messages
+    }
+
+    pub fn poll_message_queue(
+        &self,
+        policy: &MessageQueuePolicy,
+        now_unix: u64,
+    ) -> MessageQueuePoll {
+        policy.poll(&self.queued_messages, now_unix)
     }
 
     pub fn enqueue_outbound_delivery(

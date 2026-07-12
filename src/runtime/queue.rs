@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::{
@@ -129,5 +131,141 @@ impl<'de> Deserialize<'de> for QueuedMessage {
         };
         queued.validate().map_err(de::Error::custom)?;
         Ok(queued)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageBatch {
+    session_id: SessionId,
+    messages: Vec<QueuedMessage>,
+    ready_at_unix: u64,
+}
+
+impl MessageBatch {
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn messages(&self) -> &[QueuedMessage] {
+        &self.messages
+    }
+
+    pub fn ready_at_unix(&self) -> u64 {
+        self.ready_at_unix
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageQueuePoll {
+    Ready(MessageBatch),
+    Waiting { next_ready_at_unix: Option<u64> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageQueuePolicy {
+    debounce_secs: u64,
+    max_batch_size: usize,
+}
+
+impl MessageQueuePolicy {
+    pub fn new(debounce_secs: u64, max_batch_size: usize) -> Result<Self, String> {
+        if max_batch_size == 0 {
+            return Err("message queue max_batch_size must be greater than zero".to_owned());
+        }
+
+        Ok(Self {
+            debounce_secs,
+            max_batch_size,
+        })
+    }
+
+    pub fn debounce_secs(&self) -> u64 {
+        self.debounce_secs
+    }
+
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
+
+    pub(crate) fn poll(
+        &self,
+        queued_messages: &[QueuedMessage],
+        now_unix: u64,
+    ) -> MessageQueuePoll {
+        let mut by_session: BTreeMap<&SessionId, Vec<&QueuedMessage>> = BTreeMap::new();
+        for queued in queued_messages {
+            by_session
+                .entry(queued.session_id())
+                .or_default()
+                .push(queued);
+        }
+
+        let mut ready = Vec::new();
+        let mut next_ready_at_unix = None;
+        for (session_id, messages) in by_session {
+            let ready_at_unix = if messages.len() >= self.max_batch_size {
+                messages[self.max_batch_size - 1].enqueued_at_unix()
+            } else {
+                messages
+                    .last()
+                    .expect("session group must contain a message")
+                    .enqueued_at_unix()
+                    .saturating_add(self.debounce_secs)
+            };
+
+            if ready_at_unix <= now_unix {
+                ready.push((ready_at_unix, session_id, messages));
+            } else {
+                next_ready_at_unix = Some(
+                    next_ready_at_unix
+                        .map_or(ready_at_unix, |current: u64| current.min(ready_at_unix)),
+                );
+            }
+        }
+
+        let Some((ready_at_unix, session_id, messages)) = ready
+            .into_iter()
+            .min_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)))
+        else {
+            return MessageQueuePoll::Waiting { next_ready_at_unix };
+        };
+        let messages = messages
+            .into_iter()
+            .take(self.max_batch_size)
+            .cloned()
+            .collect();
+
+        MessageQueuePoll::Ready(MessageBatch {
+            session_id: session_id.clone(),
+            messages,
+            ready_at_unix,
+        })
+    }
+}
+
+impl Default for MessageQueuePolicy {
+    fn default() -> Self {
+        Self {
+            debounce_secs: 2,
+            max_batch_size: 20,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageQueuePolicy;
+
+    #[test]
+    fn message_queue_policy_rejects_empty_batches() {
+        assert!(MessageQueuePolicy::new(1, 0).is_err());
+    }
+
+    #[test]
+    fn message_queue_policy_exposes_bounds() {
+        let policy = MessageQueuePolicy::new(3, 8).expect("valid policy");
+
+        assert_eq!(policy.debounce_secs(), 3);
+        assert_eq!(policy.max_batch_size(), 8);
     }
 }
