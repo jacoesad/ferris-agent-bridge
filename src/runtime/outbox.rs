@@ -2,9 +2,15 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+mod retry;
+mod worker;
+
+pub use retry::OutboundRetryPolicy;
+pub use worker::{OutboxWorker, OutboxWorkerOutcome};
+
 use super::{
     message::{Message, MessageAuthor},
-    session::SessionId,
+    session::{SessionId, SessionScope},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -48,12 +54,70 @@ pub enum OutboundDeliveryStatus {
     Delivering,
     Delivered,
     Failed,
+    Uncertain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundDeliveryEnqueueStatus {
     Queued,
     Duplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundDeliveryAttempt {
+    delivery_id: OutboundDeliveryId,
+    session_scope: SessionScope,
+    message: Message,
+    attempt_number: u32,
+}
+
+impl OutboundDeliveryAttempt {
+    pub(super) fn from_record(
+        delivery: &OutboundDeliveryRecord,
+        session_scope: SessionScope,
+    ) -> Result<Self, String> {
+        if delivery.status() != OutboundDeliveryStatus::Delivering {
+            return Err(format!(
+                "outbound delivery {} cannot create an adapter attempt from {:?}",
+                delivery.id(),
+                delivery.status()
+            ));
+        }
+
+        if SessionId::for_scope(&session_scope) != *delivery.session_id() {
+            return Err(format!(
+                "outbound delivery {} session scope does not match its session id",
+                delivery.id()
+            ));
+        }
+
+        Ok(Self {
+            delivery_id: delivery.id().clone(),
+            session_scope,
+            message: delivery.message().clone(),
+            attempt_number: delivery.delivery_attempts(),
+        })
+    }
+
+    pub fn delivery_id(&self) -> &OutboundDeliveryId {
+        &self.delivery_id
+    }
+
+    pub fn idempotency_key(&self) -> &str {
+        self.delivery_id.as_str()
+    }
+
+    pub fn session_scope(&self) -> &SessionScope {
+        &self.session_scope
+    }
+
+    pub fn message(&self) -> &Message {
+        &self.message
+    }
+
+    pub fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -199,36 +263,75 @@ impl OutboundDeliveryRecord {
         failed_at_unix: u64,
         error: impl Into<String>,
     ) -> Result<(), String> {
+        self.mark_unsuccessful(
+            OutboundDeliveryStatus::Failed,
+            failed_at_unix,
+            error,
+            "fail",
+            "failure",
+        )
+    }
+
+    pub fn mark_uncertain(
+        &mut self,
+        uncertain_at_unix: u64,
+        error: impl Into<String>,
+    ) -> Result<(), String> {
+        self.mark_unsuccessful(
+            OutboundDeliveryStatus::Uncertain,
+            uncertain_at_unix,
+            error,
+            "become uncertain",
+            "uncertain outcome",
+        )
+    }
+
+    fn mark_unsuccessful(
+        &mut self,
+        status: OutboundDeliveryStatus,
+        updated_at_unix: u64,
+        error: impl Into<String>,
+        action: &str,
+        error_label: &str,
+    ) -> Result<(), String> {
+        debug_assert!(matches!(
+            status,
+            OutboundDeliveryStatus::Failed | OutboundDeliveryStatus::Uncertain
+        ));
+
         if self.status != OutboundDeliveryStatus::Delivering {
             return Err(format!(
-                "outbound delivery {} cannot fail from {:?}",
-                self.id, self.status
+                "outbound delivery {} cannot {action} from {:?}",
+                self.id, self.status,
             ));
         }
 
-        if failed_at_unix < self.created_at_unix {
+        if updated_at_unix < self.created_at_unix {
             return Err(format!(
-                "outbound delivery {} cannot fail before created_at_unix",
-                self.id
+                "outbound delivery {} cannot {action} before created_at_unix",
+                self.id,
             ));
         }
 
-        if failed_at_unix < self.updated_at_unix {
+        if updated_at_unix < self.updated_at_unix {
             return Err(format!(
-                "outbound delivery {} cannot fail before updated_at_unix",
-                self.id
+                "outbound delivery {} cannot {action} before updated_at_unix",
+                self.id,
             ));
         }
 
         let error = error.into();
         if error.trim().is_empty() {
-            return Err(format!("outbound delivery {} failure is empty", self.id));
+            return Err(format!(
+                "outbound delivery {} {error_label} is empty",
+                self.id
+            ));
         }
 
-        self.status = OutboundDeliveryStatus::Failed;
+        self.status = status;
         self.delivered_at_unix = None;
         self.last_error = Some(error);
-        self.touch_at(failed_at_unix);
+        self.touch_at(updated_at_unix);
         Ok(())
     }
 
@@ -324,14 +427,14 @@ impl OutboundDeliveryRecord {
                     ));
                 }
             }
-            OutboundDeliveryStatus::Failed => {
+            OutboundDeliveryStatus::Failed | OutboundDeliveryStatus::Uncertain => {
                 if self.delivery_attempts == 0
                     || self.delivered_at_unix.is_some()
                     || self.last_error.is_none()
                 {
                     return Err(format!(
-                        "failed outbound delivery {} must have attempts and last_error only",
-                        self.id
+                        "{:?} outbound delivery {} must have attempts and last_error only",
+                        self.status, self.id
                     ));
                 }
             }
@@ -391,7 +494,9 @@ fn is_valid_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutboundDeliveryId, OutboundDeliveryRecord, OutboundDeliveryStatus};
+    use super::{
+        OutboundDeliveryAttempt, OutboundDeliveryId, OutboundDeliveryRecord, OutboundDeliveryStatus,
+    };
     use crate::runtime::{
         message::{Message, MessageAuthor, MessageContent, MessageId},
         session::{SessionId, SessionScope},
@@ -429,6 +534,55 @@ mod tests {
     }
 
     #[test]
+    fn outbound_delivery_preserves_uncertain_outcomes_without_retrying() {
+        let mut delivery = delivery_fixture("out_1", 10);
+        delivery.begin_delivery(11).expect("delivery should start");
+        delivery
+            .mark_uncertain(12, "provider acceptance is unknown")
+            .expect("uncertain outcome should persist");
+
+        assert_eq!(delivery.status(), OutboundDeliveryStatus::Uncertain);
+        assert_eq!(
+            delivery.last_error(),
+            Some("provider acceptance is unknown")
+        );
+        assert_eq!(delivery.delivery_attempts(), 1);
+
+        let err = delivery
+            .begin_delivery(13)
+            .expect_err("uncertain delivery must not retry automatically");
+        assert!(err.contains("cannot start from Uncertain"));
+
+        let encoded = serde_json::to_string(&delivery).expect("delivery should serialize");
+        let decoded: OutboundDeliveryRecord =
+            serde_json::from_str(&encoded).expect("uncertain delivery should decode");
+        assert_eq!(decoded, delivery);
+    }
+
+    #[test]
+    fn outbound_attempt_requires_a_claimed_record_and_matching_scope() {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let mut delivery = delivery_fixture("out_1", 10);
+
+        let err = OutboundDeliveryAttempt::from_record(&delivery, scope.clone())
+            .expect_err("pending deliveries cannot become adapter attempts");
+        assert!(err.contains("from Pending"));
+
+        delivery.begin_delivery(11).expect("delivery should claim");
+        let attempt = OutboundDeliveryAttempt::from_record(&delivery, scope)
+            .expect("claimed delivery should become an attempt");
+        assert_eq!(attempt.delivery_id(), delivery.id());
+        assert_eq!(attempt.idempotency_key(), delivery.id().as_str());
+        assert_eq!(attempt.message(), delivery.message());
+        assert_eq!(attempt.attempt_number(), 1);
+
+        let other_scope = SessionScope::new("lark", "chat:oc_other").expect("valid scope");
+        let err = OutboundDeliveryAttempt::from_record(&delivery, other_scope)
+            .expect_err("scope must match the persisted session");
+        assert!(err.contains("session scope"));
+    }
+
+    #[test]
     fn outbound_delivery_rejects_invalid_state_transitions() {
         let mut delivery = delivery_fixture("out_1", 10);
 
@@ -443,6 +597,13 @@ mod tests {
         assert!(err.contains("before created_at_unix"));
 
         delivery.begin_delivery(11).expect("delivery should start");
+        let before_empty_uncertain = delivery.clone();
+        let err = delivery
+            .mark_uncertain(12, "  ")
+            .expect_err("uncertain outcome requires a non-empty error");
+        assert!(err.contains("uncertain outcome is empty"));
+        assert_eq!(delivery, before_empty_uncertain);
+
         delivery
             .mark_delivered(12)
             .expect("delivery should complete");
@@ -496,6 +657,19 @@ mod tests {
 
         assert!(err.contains("before updated_at_unix"));
         assert_eq!(failed, before_failed);
+
+        let mut uncertain = delivery_fixture("out_uncertain", 10);
+        uncertain
+            .begin_delivery(100)
+            .expect("delivery should start");
+        let before_uncertain = uncertain.clone();
+
+        let err = uncertain
+            .mark_uncertain(99, "provider acceptance is unknown")
+            .expect_err("uncertain outcome cannot predate the attempt");
+
+        assert!(err.contains("before updated_at_unix"));
+        assert_eq!(uncertain, before_uncertain);
 
         let mut retried = delivery_fixture("out_3", 10);
         retried.begin_delivery(100).expect("delivery should start");
@@ -552,6 +726,14 @@ mod tests {
             .expect_err("delivered_at_unix must not predate updated_at_unix");
 
         assert!(err.to_string().contains("must match updated_at_unix"));
+
+        let mut value =
+            serde_json::to_value(delivery_fixture("out_3", 10)).expect("delivery should encode");
+        value["status"] = serde_json::Value::String("uncertain".to_owned());
+
+        let err = serde_json::from_value::<OutboundDeliveryRecord>(value)
+            .expect_err("uncertain status must have a last error");
+        assert!(err.to_string().contains("last_error"));
     }
 
     #[test]

@@ -63,6 +63,8 @@ Core Runtime
 
 当某个 transport 支持显式 delivery acknowledgement 时，adapter 应先请求 runtime 持久化或去重归一化后的 inbound event，然后再 ack 平台 delivery。Foundation layer 提供 persistence primitive，初始 runtime orchestrator 边界通过 `InboundDelivery` 和 `ImAdapter::acknowledge_inbound_delivery` 把这一步接起来：runtime 先记录新 event 或识别 duplicate，然后才调用 adapter acknowledgement。重复投递判断使用归一化后的 `EventId`，所以 IM adapter 在把 event 交给 runtime 前，必须按 platform 和 scope 给 provider delivery identifier 加命名空间。如果持久化失败，本次 delivery 必须保持未 ack，让平台按照自身 transport 语义重试。真实 provider transport 仍属于具体 IM adapter 内部。
 
+Outbound delivery 使用相反方向的 durable boundary。Runtime 先 claim outbox record，再构造包含稳定 delivery id、normalized scope、message 和 attempt number 的 `OutboundDeliveryAttempt`。`ImAdapter::deliver_outbound_message` 接收这个平台无关的 attempt，并且只有在能够确认 provider 未接受请求时才能把 failure 标记为 retryable；不明确的 transport outcome 保持 uncertain，不能自动重试。Provider request types、幂等机制和 transport 细节留在具体 adapter 内部。Runtime 会先记录 adapter outcome，再调度下一次 attempt。
+
 ### Core 与平台模块
 
 Core runtime 模块应定义平台无关的领域模型和行为：

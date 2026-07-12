@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use crate::runtime::persistence::write_json_atomic;
+use crate::runtime::{outbox::OutboundDeliveryStatus, persistence::write_json_atomic};
 
 use super::{
     super::{
@@ -64,7 +64,10 @@ impl StateStore {
 
     pub(super) fn save_unlocked(&self, state: &RuntimeState) -> Result<(), String> {
         let mut state = state.clone();
-        if let Some(existing) = self.load_existing_for_merge()? {
+        let existing = self.load_existing_for_merge()?;
+        validate_snapshot_outbound_additions(&state, existing.as_ref())?;
+
+        if let Some(existing) = existing {
             state.preserve_inbound_events_from(&existing)?;
             state.preserve_outbound_deliveries_from(&existing)?;
         }
@@ -113,6 +116,27 @@ impl StateStore {
     }
 }
 
+fn validate_snapshot_outbound_additions(
+    candidate: &RuntimeState,
+    existing: Option<&RuntimeState>,
+) -> Result<(), String> {
+    for delivery in candidate.outbound_deliveries() {
+        let already_exists = existing
+            .and_then(|state| state.outbound_delivery(delivery.id()))
+            .is_some();
+
+        if !already_exists && delivery.status() != OutboundDeliveryStatus::Pending {
+            return Err(format!(
+                "runtime state save cannot introduce outbound delivery {} with status {:?}; new snapshot deliveries must be pending",
+                delivery.id(),
+                delivery.status()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -123,7 +147,8 @@ mod tests {
     use super::StateStore;
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecord},
-        message::Message,
+        message::{Message, MessageAuthor, MessageContent, MessageId},
+        outbox::{OutboundDeliveryId, OutboundDeliveryRecord, OutboundDeliveryStatus},
         run::{RunId, RunRecord, RunStatus},
         session::{Session, SessionScope},
         state::RuntimeState,
@@ -224,6 +249,43 @@ mod tests {
         assert_eq!(loaded.sessions().len(), 2);
     }
     #[test]
+    fn state_store_save_accepts_new_pending_outbound_delivery() {
+        let path = test_path("state-save-new-pending-outbound").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let state = state_with_outbound_status(OutboundDeliveryStatus::Pending);
+
+        store.save(&state).expect("pending delivery should save");
+
+        let loaded = store.load().expect("saved state should load");
+        assert_eq!(loaded.outbound_deliveries().len(), 1);
+        assert_eq!(
+            loaded.outbound_deliveries()[0].status(),
+            OutboundDeliveryStatus::Pending
+        );
+    }
+    #[test]
+    fn state_store_save_rejects_new_non_pending_outbound_deliveries() {
+        for status in [
+            OutboundDeliveryStatus::Delivering,
+            OutboundDeliveryStatus::Delivered,
+            OutboundDeliveryStatus::Failed,
+            OutboundDeliveryStatus::Uncertain,
+        ] {
+            let path = test_path(&format!("state-save-new-{status:?}-outbound"))
+                .join("runtime.state.json");
+            let store = StateStore::new(&path);
+            let state = state_with_outbound_status(status);
+
+            let err = store
+                .save(&state)
+                .expect_err("non-pending delivery must not enter through snapshot save");
+
+            assert!(err.contains("new snapshot deliveries must be pending"));
+            assert!(err.contains(&format!("{status:?}")));
+            assert!(!path.exists(), "rejected snapshot must not create state");
+        }
+    }
+    #[test]
     fn missing_state_loads_as_empty_state() {
         let path = test_path("missing-state").join("runtime.state.json");
         let store = StateStore::new(path);
@@ -317,5 +379,61 @@ mod tests {
         recorded_at_unix: u64,
     ) -> Result<InboundEventRecord, String> {
         InboundEventRecord::from_event(event, recorded_at_unix)
+    }
+    fn state_with_outbound_status(status: OutboundDeliveryStatus) -> RuntimeState {
+        let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
+        let session = Session::new(scope);
+        let session_id = session.id().clone();
+        let message = Message::new(
+            MessageId::new("msg_out_1").expect("valid message id"),
+            Some(session_id.clone()),
+            MessageAuthor::Agent,
+            MessageContent::text("reply").expect("valid text"),
+            10,
+        );
+        let delivery = OutboundDeliveryRecord::new(
+            OutboundDeliveryId::new("out_1").expect("valid delivery id"),
+            session_id,
+            message,
+            10,
+        )
+        .expect("valid outbound delivery");
+        let delivery_id = delivery.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        state
+            .enqueue_outbound_delivery(delivery)
+            .expect("delivery should enqueue");
+
+        if status != OutboundDeliveryStatus::Pending {
+            state
+                .claim_next_outbound_delivery(11)
+                .expect("delivery should claim");
+        }
+
+        match status {
+            OutboundDeliveryStatus::Pending | OutboundDeliveryStatus::Delivering => {}
+            OutboundDeliveryStatus::Delivered => {
+                state
+                    .mark_outbound_delivery_delivered(&delivery_id, 12)
+                    .expect("delivery should complete");
+            }
+            OutboundDeliveryStatus::Failed => {
+                state
+                    .mark_outbound_delivery_failed(&delivery_id, 12, "transport failed")
+                    .expect("delivery should fail");
+            }
+            OutboundDeliveryStatus::Uncertain => {
+                state
+                    .mark_outbound_delivery_uncertain(
+                        &delivery_id,
+                        12,
+                        "provider acceptance is unknown",
+                    )
+                    .expect("delivery should become uncertain");
+            }
+        }
+
+        state
     }
 }

@@ -89,11 +89,13 @@ mod tests {
     use crate::{
         adapter::{
             ImAdapter, InboundDelivery, InboundDeliveryAckToken, InboundDeliveryAcknowledgement,
+            OutboundDeliveryFailure,
         },
         runtime::{
             error::ErrorClass,
             event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
             message::Message,
+            outbox::OutboundDeliveryAttempt,
             state::StateStore,
         },
     };
@@ -234,6 +236,13 @@ mod tests {
                 return Err("transport acknowledgement failed".to_owned());
             }
 
+            Ok(())
+        }
+
+        fn deliver_outbound_message(
+            &mut self,
+            _attempt: &OutboundDeliveryAttempt,
+        ) -> Result<(), OutboundDeliveryFailure> {
             Ok(())
         }
     }

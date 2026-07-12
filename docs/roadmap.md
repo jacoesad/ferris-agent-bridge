@@ -96,11 +96,12 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Store-level ack-after-persist persistence primitive for inbound events (#11)
 - Explicit transport acknowledgement wiring through the initial `ImAdapter` and runtime orchestrator intake boundary
 - Durable outbound outbox records and enqueue-before-send persistence primitive
-- Outbox consumption state primitives: claim queued deliveries, persist delivery attempts, and mark delivered or failed before returning control to callers
-- Outbox worker, retry scheduling/backoff, and concrete outbound adapter handoff
+- Outbox consumption state primitives: claim queued deliveries, persist delivery attempts, and mark delivered, retryable-failed, or uncertain before returning control to callers
+- Single-step outbox worker with bounded retry scheduling/backoff and retry-safe normalized outbound adapter outcomes
 - Per-scope message queue with debounce and batching
 - Scope-level mutual exclusion: at most one active run per scope
 - Startup recovery for pending, running, and failed runs into explicit states
+- Startup recovery and explicit reconciliation states for outbound deliveries left `delivering`, without blind retries
 - Workspace policy skeleton with testable decisions
 - Access policy skeleton with testable decisions
 - Remaining `ImAdapter` capabilities and `AgentAdapter` capability traits
@@ -128,6 +129,7 @@ Goal: complete the first minimal end-to-end bridge path with one chat platform a
 - Platform-specific auth with `app_secret` persisted through a local encrypted keystore, never plaintext config
 - Event transport as an adapter implementation detail, such as WebSocket, webhook, or future official channel SDK
 - Platform API client for sending messages and reading metadata
+- Provider-aware outbound idempotency and reconciliation: reuse stable delivery ids through supported idempotency keys or status queries, distinguish confirmed non-acceptance from ambiguous outcomes, and never blindly replay unresolved attempts
 - Incoming message normalization and outgoing text/markdown reply path
 - Connection between chat events, runtime sessions, and the first agent adapter
 - Minimal local configuration for the selected platform

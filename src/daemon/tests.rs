@@ -631,6 +631,7 @@ fn temp_test_dir(name: &str) -> PathBuf {
     ))
 }
 
+#[cfg(unix)]
 fn dead_test_pid() -> u32 {
     let pid = u32::MAX;
     assert!(!is_process_running(pid), "test pid should not be live");

@@ -31,6 +31,7 @@ mod tests {
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
         message::Message,
+        persistence::fail_next_write_before_replace,
         state::RuntimeState,
     };
 
@@ -169,10 +170,7 @@ mod tests {
         );
     }
     #[test]
-    #[cfg(unix)]
     fn state_store_does_not_return_status_when_inbound_event_persist_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = test_path("state-inbound-event-persist-failure");
         let path = dir.join("runtime.state.json");
         let store = StateStore::new(&path);
@@ -181,13 +179,10 @@ mod tests {
         store
             .save(&RuntimeState::new())
             .expect("initial readable state should save");
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions should be set");
+        fail_next_write_before_replace(store.path());
 
         let result = store.persist_inbound_event(&event);
 
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .expect("fixture permissions should be restored");
         let err = result.expect_err("failed persistence must not return an acknowledgeable status");
         assert!(err.contains("failed to save runtime state"));
 
