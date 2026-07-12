@@ -30,7 +30,6 @@ mod tests {
     use super::super::StateStore;
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
-        message::Message,
         persistence::fail_next_write_before_replace,
         state::RuntimeState,
     };
@@ -202,11 +201,12 @@ mod tests {
         path
     }
     fn event_fixture(id: &str, received_at_unix: u64) -> Event {
-        let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
         Event::new(
             EventId::new(id).expect("valid event id"),
-            EventSource::Platform,
-            EventKind::MessageReceived { message },
+            EventSource::Runtime,
+            EventKind::RuntimeNotice {
+                message: "notice".to_owned(),
+            },
             received_at_unix,
         )
     }

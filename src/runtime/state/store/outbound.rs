@@ -636,6 +636,45 @@ mod tests {
         );
     }
     #[test]
+    fn stale_snapshot_save_keeps_durable_outbound_before_candidate_additions() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let path =
+            test_path("state-stale-save-preserves-outbound-order").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let session_id = session.id().clone();
+        let durable = outbound_delivery_fixture("out_durable", session_id.clone(), FUTURE_UNIX);
+        let candidate = outbound_delivery_fixture("out_candidate", session_id, FUTURE_UNIX);
+        let mut initial = RuntimeState::new();
+        initial.upsert_session(session);
+        store.save(&initial).expect("initial state should save");
+        let mut stale_snapshot = store.load().expect("state should load");
+        store
+            .enqueue_outbound_delivery(durable.clone())
+            .expect("durable delivery should enqueue first");
+        stale_snapshot
+            .enqueue_outbound_delivery(candidate)
+            .expect("candidate delivery should enqueue in the stale snapshot");
+
+        store
+            .save(&stale_snapshot)
+            .expect("stale save should append candidate delivery after durable delivery");
+
+        let loaded = store.load().expect("state should load");
+        let delivery_ids = loaded
+            .outbound_deliveries()
+            .iter()
+            .map(|delivery| delivery.id().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(delivery_ids, ["out_durable", "out_candidate"]);
+        let claimed = store
+            .claim_next_outbound_delivery(FUTURE_UNIX)
+            .expect("claim should succeed")
+            .expect("durable delivery should be claimable");
+        assert_eq!(claimed.id(), durable.id());
+    }
+    #[test]
     fn state_store_stale_save_fails_closed_on_conflicting_outbound_delivery() {
         let path =
             test_path("state-stale-save-conflicting-outbound-delivery").join("runtime.state.json");

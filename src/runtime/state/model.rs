@@ -1,16 +1,17 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::runtime::{
-    event::{Event, EventId, InboundEventRecord, InboundEventRecordStatus},
+    event::{Event, EventId, EventKind, InboundEventRecord, InboundEventRecordStatus},
     outbox::{
         OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
         OutboundDeliveryStatus,
     },
+    queue::{MessageQueuePolicy, MessageQueuePoll, QueuedMessage},
     run::{RunId, RunRecord},
     session::{Session, SessionId},
 };
@@ -20,6 +21,7 @@ pub struct RuntimeState {
     sessions: Vec<Session>,
     runs: Vec<RunRecord>,
     inbound_events: Vec<InboundEventRecord>,
+    queued_messages: Vec<QueuedMessage>,
     outbound_deliveries: Vec<OutboundDeliveryRecord>,
     updated_at_unix: u64,
 }
@@ -30,6 +32,7 @@ impl RuntimeState {
             sessions: Vec::new(),
             runs: Vec::new(),
             inbound_events: Vec::new(),
+            queued_messages: Vec::new(),
             outbound_deliveries: Vec::new(),
             updated_at_unix: unix_seconds_now(),
         }
@@ -86,6 +89,18 @@ impl RuntimeState {
 
     pub fn has_inbound_event(&self, id: &EventId) -> bool {
         self.inbound_event(id).is_some()
+    }
+
+    pub fn queued_messages(&self) -> &[QueuedMessage] {
+        &self.queued_messages
+    }
+
+    pub fn poll_message_queue(
+        &self,
+        policy: &MessageQueuePolicy,
+        now_unix: u64,
+    ) -> MessageQueuePoll {
+        policy.poll(&self.queued_messages, now_unix)
     }
 
     pub fn enqueue_outbound_delivery(
@@ -264,7 +279,10 @@ impl RuntimeState {
     pub fn validate(&self) -> Result<(), String> {
         let mut session_ids = BTreeSet::new();
         let mut run_ids = BTreeSet::new();
-        let mut inbound_event_ids = BTreeSet::new();
+        let mut inbound_event_positions = BTreeMap::new();
+        let mut queued_event_ids = BTreeSet::new();
+        let mut last_queued_at_by_session = BTreeMap::new();
+        let mut last_queued_inbound_position = None;
         let mut outbound_delivery_ids = BTreeSet::new();
 
         for session in &self.sessions {
@@ -298,10 +316,13 @@ impl RuntimeState {
             }
         }
 
-        for event in &self.inbound_events {
+        for (position, event) in self.inbound_events.iter().enumerate() {
             event.validate()?;
 
-            if !inbound_event_ids.insert(event.id()) {
+            if inbound_event_positions
+                .insert(event.id(), position)
+                .is_some()
+            {
                 return Err(format!("duplicate inbound event id {}", event.id()));
             }
 
@@ -330,6 +351,78 @@ impl RuntimeState {
             }
         }
 
+        for queued in &self.queued_messages {
+            queued.validate()?;
+
+            if !queued_event_ids.insert(queued.event_id()) {
+                return Err(format!(
+                    "duplicate queued inbound event id {}",
+                    queued.event_id()
+                ));
+            }
+
+            let inbound_position =
+                *inbound_event_positions
+                    .get(queued.event_id())
+                    .ok_or_else(|| {
+                        format!(
+                            "queued message event {} has no inbound event record",
+                            queued.event_id()
+                        )
+                    })?;
+            let inbound_event = &self.inbound_events[inbound_position];
+
+            if let Some(previous_position) = last_queued_inbound_position {
+                if inbound_position <= previous_position {
+                    return Err(format!(
+                        "queued message event {} is out of inbound ledger order",
+                        queued.event_id()
+                    ));
+                }
+            }
+            last_queued_inbound_position = Some(inbound_position);
+
+            if queued.received_at_unix() != inbound_event.received_at_unix() {
+                return Err(format!(
+                    "queued message event {} does not match inbound event received_at_unix",
+                    queued.event_id()
+                ));
+            }
+
+            if queued.enqueued_at_unix() < inbound_event.recorded_at_unix() {
+                return Err(format!(
+                    "queued message event {} has enqueued_at_unix before inbound event recorded_at_unix",
+                    queued.event_id()
+                ));
+            }
+
+            if self.session(queued.session_id()).is_none() {
+                return Err(format!(
+                    "queued message event {} references unknown session {}",
+                    queued.event_id(),
+                    queued.session_id()
+                ));
+            }
+
+            if let Some(previous_enqueued_at) =
+                last_queued_at_by_session.insert(queued.session_id(), queued.enqueued_at_unix())
+            {
+                if queued.enqueued_at_unix() < previous_enqueued_at {
+                    return Err(format!(
+                        "queued messages for session {} are not ordered by enqueued_at_unix",
+                        queued.session_id()
+                    ));
+                }
+            }
+
+            if self.updated_at_unix < queued.enqueued_at_unix() {
+                return Err(format!(
+                    "runtime state updated_at_unix before queued message event {} enqueued_at_unix",
+                    queued.event_id()
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -337,6 +430,7 @@ impl RuntimeState {
         sessions: Vec<Session>,
         runs: Vec<RunRecord>,
         inbound_events: Vec<InboundEventRecord>,
+        queued_messages: Vec<QueuedMessage>,
         outbound_deliveries: Vec<OutboundDeliveryRecord>,
         updated_at_unix: u64,
         normalize_aggregate_updated_at: bool,
@@ -345,6 +439,7 @@ impl RuntimeState {
             sessions,
             runs,
             inbound_events,
+            queued_messages,
             outbound_deliveries,
             updated_at_unix,
         };
@@ -404,15 +499,83 @@ impl RuntimeState {
         event: &Event,
         recorded_at_unix: u64,
     ) -> Result<InboundEventRecordStatus, String> {
-        if self.has_inbound_event(&event.id) {
+        let queued = self.queued_message_for_event(event, recorded_at_unix)?;
+        if let Some(existing_record) = self.inbound_event(&event.id) {
+            if existing_record.received_at_unix() != event.received_at_unix {
+                return Err(format!(
+                    "conflicting inbound event {} received_at_unix",
+                    event.id
+                ));
+            }
+
+            let existing_queued = self
+                .queued_messages
+                .iter()
+                .find(|queued| queued.event_id() == &event.id);
+            match (existing_queued, queued.as_ref()) {
+                (Some(existing_queued), Some(candidate_queued)) => {
+                    if !existing_queued.has_same_identity(candidate_queued) {
+                        return Err(format!("conflicting queued message event {}", event.id));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(format!(
+                        "duplicate inbound event {} conflicts with a queued message record",
+                        event.id
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "duplicate inbound message event {} has no queued message record",
+                        event.id
+                    ));
+                }
+                (None, None) => {}
+            }
+
             return Ok(InboundEventRecordStatus::Duplicate);
         }
 
         let record = InboundEventRecord::from_event(event, recorded_at_unix)?;
         let recorded_at_unix = record.recorded_at_unix();
         self.inbound_events.push(record);
+        if let Some(queued) = queued {
+            self.touch_at(queued.enqueued_at_unix());
+            self.queued_messages.push(queued);
+        }
         self.touch_at(recorded_at_unix);
         Ok(InboundEventRecordStatus::Recorded)
+    }
+
+    fn queued_message_for_event(
+        &self,
+        event: &Event,
+        recorded_at_unix: u64,
+    ) -> Result<Option<QueuedMessage>, String> {
+        let EventKind::MessageReceived { message } = &event.kind else {
+            return Ok(None);
+        };
+        let session_id = message.session_id.as_ref().ok_or_else(|| {
+            format!(
+                "inbound message event {} must reference a session before persistence",
+                event.id
+            )
+        })?;
+        if self.session(session_id).is_none() {
+            return Err(format!(
+                "inbound message event {} references unknown session {}",
+                event.id, session_id
+            ));
+        }
+        let previous_enqueued_at = self
+            .queued_messages
+            .iter()
+            .rev()
+            .find(|queued| queued.session_id() == session_id)
+            .map(QueuedMessage::enqueued_at_unix)
+            .unwrap_or(0);
+
+        QueuedMessage::from_event(event, recorded_at_unix.max(previous_enqueued_at)).map(Some)
     }
 
     fn touch_at(&mut self, updated_at_unix: u64) {
@@ -435,33 +598,83 @@ impl RuntimeState {
                     .iter()
                     .map(OutboundDeliveryRecord::updated_at_unix),
             )
+            .chain(
+                self.queued_messages
+                    .iter()
+                    .map(QueuedMessage::enqueued_at_unix),
+            )
             .fold(self.updated_at_unix, u64::max);
         self.updated_at_unix = updated_at_unix;
+    }
+
+    pub(super) fn validate_shared_inbound_event_identity(
+        &self,
+        existing: &RuntimeState,
+    ) -> Result<(), String> {
+        for candidate_event in &self.inbound_events {
+            let Some(existing_event) = existing
+                .inbound_events
+                .iter()
+                .find(|event| event.id() == candidate_event.id())
+            else {
+                continue;
+            };
+            if existing_event != candidate_event {
+                return Err(format!(
+                    "conflicting inbound event record {}",
+                    candidate_event.id()
+                ));
+            }
+
+            let existing_queued = existing
+                .queued_messages
+                .iter()
+                .find(|queued| queued.event_id() == candidate_event.id());
+            let candidate_queued = self
+                .queued_messages
+                .iter()
+                .find(|queued| queued.event_id() == candidate_event.id());
+            match (existing_queued, candidate_queued) {
+                (Some(existing_queued), Some(candidate_queued))
+                    if existing_queued.has_same_identity(candidate_queued) => {}
+                (None, None) => {}
+                _ => {
+                    return Err(format!(
+                        "conflicting inbound event queue identity {}",
+                        candidate_event.id()
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(super) fn preserve_inbound_events_from(
         &mut self,
         existing: &RuntimeState,
     ) -> Result<(), String> {
-        for existing_event in &existing.inbound_events {
-            match self
+        let mut merged = existing.inbound_events.clone();
+        for candidate_event in &self.inbound_events {
+            match existing
                 .inbound_events
                 .iter()
-                .find(|event| event.id() == existing_event.id())
+                .find(|event| event.id() == candidate_event.id())
             {
-                Some(candidate_event) if candidate_event == existing_event => {}
+                Some(existing_event) if existing_event == candidate_event => {}
                 Some(_) => {
                     return Err(format!(
                         "conflicting inbound event record {}",
-                        existing_event.id()
+                        candidate_event.id()
                     ));
                 }
-                None => {
-                    self.touch_at(existing_event.recorded_at_unix());
-                    self.inbound_events.push(existing_event.clone());
-                }
+                None => merged.push(candidate_event.clone()),
             }
         }
+        for event in &merged {
+            self.touch_at(event.recorded_at_unix());
+        }
+        self.inbound_events = merged;
 
         Ok(())
     }
@@ -470,25 +683,73 @@ impl RuntimeState {
         &mut self,
         existing: &RuntimeState,
     ) -> Result<(), String> {
-        for existing_delivery in &existing.outbound_deliveries {
-            match self
+        let mut merged = existing.outbound_deliveries.clone();
+        for candidate_delivery in &self.outbound_deliveries {
+            match existing
                 .outbound_deliveries
                 .iter()
-                .find(|delivery| delivery.id() == existing_delivery.id())
+                .find(|delivery| delivery.id() == candidate_delivery.id())
             {
-                Some(candidate_delivery) if candidate_delivery == existing_delivery => {}
+                Some(existing_delivery) if existing_delivery == candidate_delivery => {}
                 Some(_) => {
                     return Err(format!(
                         "conflicting outbound delivery {}",
-                        existing_delivery.id()
+                        candidate_delivery.id()
+                    ));
+                }
+                None => merged.push(candidate_delivery.clone()),
+            }
+        }
+        for delivery in &merged {
+            self.touch_at(delivery.updated_at_unix());
+        }
+        self.outbound_deliveries = merged;
+
+        Ok(())
+    }
+
+    pub(super) fn preserve_queued_messages_from(
+        &mut self,
+        existing: &RuntimeState,
+    ) -> Result<(), String> {
+        let mut merged = existing.queued_messages.clone();
+        let mut last_queued_at_by_session = BTreeMap::new();
+        for queued in &merged {
+            last_queued_at_by_session
+                .insert(queued.session_id().clone(), queued.enqueued_at_unix());
+        }
+        for candidate_queued in &self.queued_messages {
+            match existing
+                .queued_messages
+                .iter()
+                .find(|queued| queued.event_id() == candidate_queued.event_id())
+            {
+                Some(existing_queued) if existing_queued.has_same_identity(candidate_queued) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting queued message event {}",
+                        candidate_queued.event_id()
                     ));
                 }
                 None => {
-                    self.touch_at(existing_delivery.updated_at_unix());
-                    self.outbound_deliveries.push(existing_delivery.clone());
+                    let mut candidate_queued = candidate_queued.clone();
+                    if let Some(previous_enqueued_at) =
+                        last_queued_at_by_session.get(candidate_queued.session_id())
+                    {
+                        candidate_queued.rebase_enqueued_at_unix(*previous_enqueued_at);
+                    }
+                    last_queued_at_by_session.insert(
+                        candidate_queued.session_id().clone(),
+                        candidate_queued.enqueued_at_unix(),
+                    );
+                    merged.push(candidate_queued);
                 }
             }
         }
+        for queued in &merged {
+            self.touch_at(queued.enqueued_at_unix());
+        }
+        self.queued_messages = merged;
 
         Ok(())
     }
@@ -511,6 +772,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
             sessions: Vec<Session>,
             runs: Vec<RunRecord>,
             inbound_events: Vec<InboundEventRecord>,
+            queued_messages: Vec<QueuedMessage>,
             outbound_deliveries: Vec<OutboundDeliveryRecord>,
             updated_at_unix: u64,
         }
@@ -520,6 +782,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
             sessions: wire.sessions,
             runs: wire.runs,
             inbound_events: wire.inbound_events,
+            queued_messages: wire.queued_messages,
             outbound_deliveries: wire.outbound_deliveries,
             updated_at_unix: wire.updated_at_unix,
         };
@@ -559,6 +822,7 @@ mod tests {
         assert!(encoded.get("sessions").is_some());
         assert!(encoded.get("runs").is_some());
         assert!(encoded.get("inbound_events").is_some());
+        assert!(encoded.get("queued_messages").is_some());
         assert!(encoded.get("outbound_deliveries").is_some());
         assert!(encoded.get("updated_at_unix").is_some());
     }
@@ -983,11 +1247,12 @@ mod tests {
     }
 
     fn event_fixture(id: &str, received_at_unix: u64) -> Event {
-        let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
         Event::new(
             EventId::new(id).expect("valid event id"),
-            EventSource::Platform,
-            EventKind::MessageReceived { message },
+            EventSource::Runtime,
+            EventKind::RuntimeNotice {
+                message: "notice".to_owned(),
+            },
             received_at_unix,
         )
     }

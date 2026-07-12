@@ -96,7 +96,8 @@ mod tests {
             event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
             message::Message,
             outbox::OutboundDeliveryAttempt,
-            state::StateStore,
+            session::{Session, SessionId, SessionScope},
+            state::{RuntimeState, StateStore},
         },
     };
 
@@ -106,9 +107,8 @@ mod tests {
 
     #[test]
     fn accept_inbound_delivery_persists_before_acknowledging() {
-        let store =
-            StateStore::new(test_path("accept-inbound-delivery").join("runtime.state.json"));
-        let event = event_fixture("evt_1");
+        let (store, session_id) = state_store_with_session("accept-inbound-delivery");
+        let event = event_fixture("evt_1", &session_id);
         let mut adapter = RecordingImAdapter::with_state_check(store.clone());
         let orchestrator = RuntimeOrchestrator::new(store.clone());
 
@@ -127,13 +127,14 @@ mod tests {
 
         let state = store.load().expect("state should load");
         assert!(state.has_inbound_event(&event.id));
+        assert_eq!(state.queued_messages().len(), 1);
+        assert_eq!(state.queued_messages()[0].event_id(), &event.id);
     }
 
     #[test]
     fn accept_inbound_delivery_acknowledges_duplicate_events() {
-        let store =
-            StateStore::new(test_path("accept-duplicate-delivery").join("runtime.state.json"));
-        let event = event_fixture("evt_1");
+        let (store, session_id) = state_store_with_session("accept-duplicate-delivery");
+        let event = event_fixture("evt_1", &session_id);
         store
             .persist_inbound_event(&event)
             .expect("first event should persist");
@@ -153,6 +154,7 @@ mod tests {
 
         let state = store.load().expect("state should load");
         assert_eq!(state.inbound_events().len(), 1);
+        assert_eq!(state.queued_messages().len(), 1);
     }
 
     #[test]
@@ -168,7 +170,15 @@ mod tests {
         let err = orchestrator
             .accept_inbound_delivery(
                 &mut adapter,
-                delivery_fixture(event_fixture("evt_1"), "ack_1"),
+                delivery_fixture(
+                    event_fixture(
+                        "evt_1",
+                        &SessionId::for_scope(
+                            &SessionScope::new("lark", "chat:oc_123").expect("valid scope"),
+                        ),
+                    ),
+                    "ack_1",
+                ),
             )
             .expect_err("persistence failure must not be acknowledged");
 
@@ -179,8 +189,8 @@ mod tests {
 
     #[test]
     fn accept_inbound_delivery_reports_acknowledgement_failure_after_persistence() {
-        let store = StateStore::new(test_path("ack-failure").join("runtime.state.json"));
-        let event = event_fixture("evt_1");
+        let (store, session_id) = state_store_with_session("ack-failure");
+        let event = event_fixture("evt_1", &session_id);
         let mut adapter = RecordingImAdapter {
             fail_ack: true,
             ..RecordingImAdapter::default()
@@ -228,6 +238,16 @@ mod tests {
                         acknowledgement.event_id()
                     ));
                 }
+                if !state
+                    .queued_messages()
+                    .iter()
+                    .any(|queued| queued.event_id() == acknowledgement.event_id())
+                {
+                    return Err(format!(
+                        "acknowledged inbound message {} before queue persistence",
+                        acknowledgement.event_id()
+                    ));
+                }
             }
 
             self.acknowledgements.push(acknowledgement.clone());
@@ -254,14 +274,26 @@ mod tests {
         )
     }
 
-    fn event_fixture(id: &str) -> Event {
-        let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
+    fn event_fixture(id: &str, session_id: &SessionId) -> Event {
+        let message = Message::user_text(format!("msg_{id}"), Some(session_id.clone()), "hello", 1)
+            .expect("valid message");
         Event::new(
             EventId::new(id).expect("valid event id"),
             EventSource::Platform,
             EventKind::MessageReceived { message },
             2,
         )
+    }
+
+    fn state_store_with_session(label: &str) -> (StateStore, SessionId) {
+        let store = StateStore::new(test_path(label).join("runtime.state.json"));
+        let session =
+            Session::new(SessionScope::new("lark", format!("chat:{label}")).expect("valid scope"));
+        let session_id = session.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(session);
+        store.save(&state).expect("session should persist");
+        (store, session_id)
     }
 
     fn test_path(label: &str) -> PathBuf {

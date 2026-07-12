@@ -6,6 +6,7 @@ pub mod message;
 pub mod orchestrator;
 pub mod outbox;
 mod persistence;
+pub mod queue;
 pub mod run;
 pub mod session;
 pub mod state;
@@ -23,6 +24,7 @@ pub use outbox::{
     OutboundDeliveryRecord, OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker,
     OutboxWorkerOutcome,
 };
+pub use queue::{MessageBatch, MessageQueuePolicy, MessageQueuePoll, QueuedMessage};
 pub use run::{RunId, RunRecord, RunStatus};
 pub use session::{Session, SessionId, SessionScope};
 pub use state::{RuntimeState, StateStore};
