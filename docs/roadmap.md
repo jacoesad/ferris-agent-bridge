@@ -98,7 +98,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Durable outbound outbox records and enqueue-before-send persistence primitive
 - Outbox consumption state primitives: claim queued deliveries, persist delivery attempts, and mark delivered, retryable-failed, or uncertain before returning control to callers
 - Single-step outbox worker with bounded retry scheduling/backoff and retry-safe normalized outbound adapter outcomes
-- Per-scope message queue with debounce and batching
+- Durable per-scope message queue, persisted with inbound ledger records before acknowledgement, with debounce and bounded batching
 - Scope-level mutual exclusion: at most one active run per scope
 - Startup recovery for pending, running, and failed runs into explicit states
 - Startup recovery and explicit reconciliation states for outbound deliveries left `delivering`, without blind retries

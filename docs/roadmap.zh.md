@@ -98,7 +98,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Durable outbound outbox records，以及 send 前必须 enqueue 的 persistence primitive
 - Outbox consumption state primitives：领取 queued deliveries、持久化 delivery attempts，并在返回调用方前标记 delivered、retryable-failed 或 uncertain
 - Single-step outbox worker，包含 bounded retry scheduling/backoff 和 retry-safe normalized outbound adapter outcomes
-- Per-scope message queue，包含 debounce 和 batching
+- Durable per-scope message queue，在 acknowledgement 前与 inbound ledger record 一起持久化，并包含 debounce 和 bounded batching
 - Scope 级互斥：同一个 scope 同时最多一个 active run
 - Startup recovery，将 pending、running 和 failed runs 恢复为显式状态
 - Outbound delivery 遗留为 `delivering` 时的 startup recovery 和显式 reconciliation state，禁止盲目重试
