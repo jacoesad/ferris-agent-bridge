@@ -1,9 +1,11 @@
-use crate::runtime::{event::InboundEventRecord, outbox::OutboundDeliveryRecord, run::RunRecord};
+use crate::runtime::{
+    event::InboundEventRecord, outbox::OutboundDeliveryRecord, queue::QueuedMessage, run::RunRecord,
+};
 
 use super::{
     current::{
         RUNTIME_STATE_FILE_V1_VERSION, RUNTIME_STATE_FILE_V2_VERSION,
-        RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_VERSION,
+        RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_V4_VERSION, RUNTIME_STATE_FILE_VERSION,
     },
     wire::WireField,
 };
@@ -11,6 +13,7 @@ use super::{
 pub(super) struct PersistedCollections {
     pub(super) runs: Vec<RunRecord>,
     pub(super) inbound_events: Vec<InboundEventRecord>,
+    pub(super) queued_messages: Vec<QueuedMessage>,
     pub(super) outbound_deliveries: Vec<OutboundDeliveryRecord>,
     pub(super) normalize_aggregate_updated_at: bool,
 }
@@ -19,10 +22,16 @@ pub(super) fn decode_persisted_collections(
     version: u32,
     runs: WireField<Vec<RunRecord>>,
     inbound_events: WireField<Vec<InboundEventRecord>>,
+    queued_messages: WireField<Vec<QueuedMessage>>,
     outbound_deliveries: WireField<Vec<OutboundDeliveryRecord>>,
 ) -> Result<PersistedCollections, String> {
-    let (runs, inbound_events, outbound_deliveries, normalize_aggregate_updated_at) = match version
-    {
+    let (
+        runs,
+        inbound_events,
+        queued_messages,
+        outbound_deliveries,
+        normalize_aggregate_updated_at,
+    ) = match version {
         RUNTIME_STATE_FILE_V1_VERSION => {
             if runs.is_present() {
                 return Err("runtime state version 1 must not contain run records".to_string());
@@ -40,7 +49,11 @@ pub(super) fn decode_persisted_collections(
                 );
             }
 
-            (Vec::new(), Vec::new(), Vec::new(), true)
+            if queued_messages.is_present() {
+                return Err("runtime state version 1 must not contain queued messages".to_string());
+            }
+
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), true)
         }
         RUNTIME_STATE_FILE_V2_VERSION => {
             let runs = runs.into_required("runtime state version 2 must contain run records")?;
@@ -57,7 +70,11 @@ pub(super) fn decode_persisted_collections(
                 );
             }
 
-            (runs, Vec::new(), Vec::new(), true)
+            if queued_messages.is_present() {
+                return Err("runtime state version 2 must not contain queued messages".to_string());
+            }
+
+            (runs, Vec::new(), Vec::new(), Vec::new(), true)
         }
         RUNTIME_STATE_FILE_V3_VERSION => {
             let runs = runs.into_required("runtime state version 3 must contain run records")?;
@@ -70,7 +87,24 @@ pub(super) fn decode_persisted_collections(
                 );
             }
 
-            (runs, inbound_events, Vec::new(), false)
+            if queued_messages.is_present() {
+                return Err("runtime state version 3 must not contain queued messages".to_string());
+            }
+
+            (runs, inbound_events, Vec::new(), Vec::new(), false)
+        }
+        RUNTIME_STATE_FILE_V4_VERSION => {
+            let runs = runs.into_required("runtime state version 4 must contain run records")?;
+            let inbound_events = inbound_events
+                .into_required("runtime state version 4 must contain inbound event records")?;
+            let outbound_deliveries = outbound_deliveries
+                .into_required("runtime state version 4 must contain outbound deliveries")?;
+
+            if queued_messages.is_present() {
+                return Err("runtime state version 4 must not contain queued messages".to_string());
+            }
+
+            (runs, inbound_events, Vec::new(), outbound_deliveries, false)
         }
         RUNTIME_STATE_FILE_VERSION => {
             let runs = runs.into_required(format!(
@@ -82,8 +116,17 @@ pub(super) fn decode_persisted_collections(
             let outbound_deliveries = outbound_deliveries.into_required(format!(
                 "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain outbound deliveries"
             ))?;
+            let queued_messages = queued_messages.into_required(format!(
+                "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain queued messages"
+            ))?;
 
-            (runs, inbound_events, outbound_deliveries, false)
+            (
+                runs,
+                inbound_events,
+                queued_messages,
+                outbound_deliveries,
+                false,
+            )
         }
         version => {
             return Err(format!(
@@ -96,6 +139,7 @@ pub(super) fn decode_persisted_collections(
     Ok(PersistedCollections {
         runs,
         inbound_events,
+        queued_messages,
         outbound_deliveries,
         normalize_aggregate_updated_at,
     })
@@ -369,12 +413,60 @@ mod tests {
         assert!(err.contains("version 3 must not contain outbound deliveries"));
     }
     #[test]
+    fn state_load_migrates_version_4_without_queued_messages() {
+        let path = test_path("state-v4-without-queued-messages").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 4,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let state = store
+            .load()
+            .expect("version 4 state without queued messages should migrate");
+
+        assert!(state.queued_messages().is_empty());
+        assert!(state.outbound_deliveries().is_empty());
+    }
+    #[test]
+    fn state_load_rejects_version_4_with_queued_messages() {
+        let path = test_path("state-v4-with-queued-messages").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 4,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "queued_messages": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("version 4 state must not carry queued messages");
+
+        assert!(err.contains("version 4 must not contain queued messages"));
+    }
+    #[test]
     fn state_load_rejects_future_file_version() {
         let path = test_path("state-future-version").join("runtime.state.json");
         fs::write(
             &path,
             r#"{
-            "version": 5,
+            "version": 6,
             "sessions": [],
             "runs": [],
             "inbound_events": [],
@@ -389,7 +481,7 @@ mod tests {
             .load()
             .expect_err("future state versions must not be loaded");
 
-        assert!(err.contains("unsupported runtime state version 5; expected 4"));
+        assert!(err.contains("unsupported runtime state version 6; expected 5"));
     }
     #[test]
     fn state_load_rejects_current_version_without_run_records() {
@@ -462,6 +554,59 @@ mod tests {
             .expect_err("current state version must reject null inbound events");
 
         assert!(err.contains("must contain inbound event records"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_without_queued_messages() {
+        let path = test_path("state-current-without-queued-messages").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [],
+                "outbound_deliveries": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must carry queued messages");
+
+        assert!(err.contains("must contain queued messages"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_with_null_queued_messages() {
+        let path = test_path("state-current-with-null-queued-messages").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [],
+                "queued_messages": null,
+                "outbound_deliveries": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(path);
+
+        let err = store
+            .load()
+            .expect_err("current state version must reject null queued messages");
+
+        assert!(err.contains("must contain queued messages"));
     }
     #[test]
     fn state_load_rejects_current_version_without_outbound_deliveries() {

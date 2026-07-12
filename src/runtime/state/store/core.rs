@@ -68,7 +68,9 @@ impl StateStore {
         validate_snapshot_outbound_additions(&state, existing.as_ref())?;
 
         if let Some(existing) = existing {
+            state.validate_shared_inbound_event_identity(&existing)?;
             state.preserve_inbound_events_from(&existing)?;
+            state.preserve_queued_messages_from(&existing)?;
             state.preserve_outbound_deliveries_from(&existing)?;
         }
 
@@ -213,6 +215,7 @@ mod tests {
                 "sessions": [],
                 "runs": [],
                 "inbound_events": [{record}],
+                "queued_messages": [],
                 "outbound_deliveries": [],
                 "updated_at_unix": 1
             }}"#,
@@ -366,11 +369,12 @@ mod tests {
         path
     }
     fn event_fixture(id: &str, received_at_unix: u64) -> Event {
-        let message = Message::user_text("msg_1", None, "hello", 1).expect("valid message");
         Event::new(
             EventId::new(id).expect("valid event id"),
-            EventSource::Platform,
-            EventKind::MessageReceived { message },
+            EventSource::Runtime,
+            EventKind::RuntimeNotice {
+                message: "notice".to_owned(),
+            },
             received_at_unix,
         )
     }
