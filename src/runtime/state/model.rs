@@ -443,25 +443,27 @@ impl RuntimeState {
         &mut self,
         existing: &RuntimeState,
     ) -> Result<(), String> {
-        for existing_event in &existing.inbound_events {
-            match self
+        let mut merged = existing.inbound_events.clone();
+        for candidate_event in &self.inbound_events {
+            match existing
                 .inbound_events
                 .iter()
-                .find(|event| event.id() == existing_event.id())
+                .find(|event| event.id() == candidate_event.id())
             {
-                Some(candidate_event) if candidate_event == existing_event => {}
+                Some(existing_event) if existing_event == candidate_event => {}
                 Some(_) => {
                     return Err(format!(
                         "conflicting inbound event record {}",
-                        existing_event.id()
+                        candidate_event.id()
                     ));
                 }
-                None => {
-                    self.touch_at(existing_event.recorded_at_unix());
-                    self.inbound_events.push(existing_event.clone());
-                }
+                None => merged.push(candidate_event.clone()),
             }
         }
+        for event in &merged {
+            self.touch_at(event.recorded_at_unix());
+        }
+        self.inbound_events = merged;
 
         Ok(())
     }
@@ -470,25 +472,27 @@ impl RuntimeState {
         &mut self,
         existing: &RuntimeState,
     ) -> Result<(), String> {
-        for existing_delivery in &existing.outbound_deliveries {
-            match self
+        let mut merged = existing.outbound_deliveries.clone();
+        for candidate_delivery in &self.outbound_deliveries {
+            match existing
                 .outbound_deliveries
                 .iter()
-                .find(|delivery| delivery.id() == existing_delivery.id())
+                .find(|delivery| delivery.id() == candidate_delivery.id())
             {
-                Some(candidate_delivery) if candidate_delivery == existing_delivery => {}
+                Some(existing_delivery) if existing_delivery == candidate_delivery => {}
                 Some(_) => {
                     return Err(format!(
                         "conflicting outbound delivery {}",
-                        existing_delivery.id()
+                        candidate_delivery.id()
                     ));
                 }
-                None => {
-                    self.touch_at(existing_delivery.updated_at_unix());
-                    self.outbound_deliveries.push(existing_delivery.clone());
-                }
+                None => merged.push(candidate_delivery.clone()),
             }
         }
+        for delivery in &merged {
+            self.touch_at(delivery.updated_at_unix());
+        }
+        self.outbound_deliveries = merged;
 
         Ok(())
     }
