@@ -101,6 +101,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Per-scope message queue，包含 debounce 和 batching
 - Scope 级互斥：同一个 scope 同时最多一个 active run
 - Startup recovery，将 pending、running 和 failed runs 恢复为显式状态
+- Outbound delivery 遗留为 `delivering` 时的 startup recovery 和显式 reconciliation state，禁止盲目重试
 - Workspace policy skeleton，并让 decisions 可测试
 - Access policy skeleton，并让 decisions 可测试
 - 剩余 `ImAdapter` 能力和 `AgentAdapter` capability traits
@@ -128,6 +129,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Platform-specific auth：`app_secret` 通过本地 encrypted keystore 持久化，绝不落 plaintext config
 - Event transport 作为 adapter implementation detail，例如 WebSocket、webhook 或未来 official channel SDK
 - 用于发送消息和读取 metadata 的 platform API client
+- Provider-aware outbound 幂等与 reconciliation：在 provider 支持时通过幂等 key 或状态查询复用稳定 delivery id，区分确认未接受与 ambiguous outcome，并且绝不盲目重放未解决的 attempt
 - Incoming message normalization 和 outgoing text/markdown reply path
 - 连接 chat events、runtime sessions 和第一个 agent adapter
 - 所选平台的 minimal local configuration
