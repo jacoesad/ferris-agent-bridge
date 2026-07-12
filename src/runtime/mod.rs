@@ -24,7 +24,10 @@ pub use outbox::{
     OutboundDeliveryRecord, OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker,
     OutboxWorkerOutcome,
 };
-pub use queue::{MessageBatch, MessageQueuePolicy, MessageQueuePoll, QueuedMessage};
+pub use queue::{
+    MessageBatch, MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
+    RunInputRecord,
+};
 pub use run::{RunId, RunRecord, RunStatus};
 pub use session::{Session, SessionId, SessionScope};
 pub use state::{RuntimeState, StateStore};

@@ -66,10 +66,12 @@ impl StateStore {
         let mut state = state.clone();
         let existing = self.load_existing_for_merge()?;
         validate_snapshot_outbound_additions(&state, existing.as_ref())?;
+        validate_snapshot_run_input_additions(&state, existing.as_ref())?;
 
         if let Some(existing) = existing {
             state.validate_shared_inbound_event_identity(&existing)?;
             state.preserve_runs_from(&existing)?;
+            state.preserve_run_inputs_from(&existing)?;
             state.preserve_inbound_events_from(&existing)?;
             state.preserve_queued_messages_from(&existing)?;
             state.preserve_outbound_deliveries_from(&existing)?;
@@ -133,6 +135,25 @@ fn validate_snapshot_outbound_additions(
                 "runtime state save cannot introduce outbound delivery {} with status {:?}; new snapshot deliveries must be pending",
                 delivery.id(),
                 delivery.status()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_snapshot_run_input_additions(
+    candidate: &RuntimeState,
+    existing: Option<&RuntimeState>,
+) -> Result<(), String> {
+    for input in candidate.run_inputs() {
+        let already_exists = existing
+            .and_then(|state| state.run_input(input.run_id()))
+            .is_some();
+        if !already_exists {
+            return Err(format!(
+                "runtime state save cannot introduce run input {}; message batches must be claimed through StateStore::claim_message_batch",
+                input.run_id()
             ));
         }
     }
@@ -338,6 +359,7 @@ mod tests {
                 "version": {version},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": [{record}],
                 "queued_messages": [],
                 "outbound_deliveries": [],
@@ -420,6 +442,7 @@ mod tests {
 
         assert!(state.sessions().is_empty());
         assert!(state.runs().is_empty());
+        assert!(state.run_inputs().is_empty());
         assert!(state.inbound_events().is_empty());
         assert!(state.outbound_deliveries().is_empty());
     }

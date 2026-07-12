@@ -1,4 +1,7 @@
-use crate::runtime::queue::{MessageQueuePolicy, MessageQueuePoll};
+use crate::runtime::{
+    queue::{MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll},
+    run::RunId,
+};
 
 use super::StateStore;
 
@@ -9,6 +12,21 @@ impl StateStore {
         now_unix: u64,
     ) -> Result<MessageQueuePoll, String> {
         Ok(self.load()?.poll_message_queue(policy, now_unix))
+    }
+
+    pub fn claim_message_batch(
+        &self,
+        run_id: RunId,
+        policy: &MessageQueuePolicy,
+        now_unix: u64,
+    ) -> Result<MessageBatchClaimOutcome, String> {
+        let _guard = self.lock_write()?;
+        let mut state = self.load()?;
+        let outcome = state.claim_message_batch(run_id, policy, now_unix)?;
+        if matches!(outcome, MessageBatchClaimOutcome::Claimed { .. }) {
+            self.write_unlocked(&state)?;
+        }
+        Ok(outcome)
     }
 }
 
@@ -26,8 +44,9 @@ mod tests {
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource, InboundEventRecordStatus},
         message::{Message, MessageAuthor, MessageContent, MessageId},
-        persistence::fail_next_write_before_replace,
-        queue::{MessageQueuePolicy, MessageQueuePoll},
+        persistence::{fail_next_write_after_replace, fail_next_write_before_replace},
+        queue::{MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll},
+        run::{RunId, RunRecord, RunStatus},
         session::{Session, SessionId, SessionScope},
         state::RuntimeState,
     };
@@ -458,6 +477,357 @@ mod tests {
         assert_eq!(batch.session_id(), &quiet_session_id);
         assert_eq!(batch.ready_at_unix(), FUTURE_UNIX + 5);
         assert_eq!(batch.messages().len(), 1);
+    }
+
+    #[test]
+    fn claim_message_batch_persists_run_input_and_removes_queue_before_returning() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let (store, session_id) = state_store_with_session("queue-claim", "chat:a");
+        let first = message_event("evt_1", "msg_1", &session_id, FUTURE_UNIX);
+        let second = message_event("evt_2", "msg_2", &session_id, FUTURE_UNIX + 1);
+        store
+            .persist_inbound_event(&first)
+            .expect("first message should persist");
+        store
+            .persist_inbound_event(&second)
+            .expect("second message should persist");
+        let run_id = RunId::new("run_1").expect("valid run id");
+        let policy = MessageQueuePolicy::new(60, 2).expect("valid policy");
+
+        let MessageBatchClaimOutcome::Claimed { run, input } = store
+            .claim_message_batch(run_id.clone(), &policy, FUTURE_UNIX + 1)
+            .expect("ready batch should claim")
+        else {
+            panic!("full batch should be claimed");
+        };
+
+        assert_eq!(run.id(), &run_id);
+        assert_eq!(run.status(), RunStatus::Pending);
+        assert_eq!(input.run_id(), &run_id);
+        assert_eq!(input.messages().len(), 2);
+        let state = store.load().expect("claimed state should load");
+        assert!(state.queued_messages().is_empty());
+        assert_eq!(state.run(&run_id), Some(&run));
+        assert_eq!(state.run_input(&run_id), Some(&input));
+
+        assert_eq!(
+            store
+                .persist_inbound_event(&first)
+                .expect("claimed duplicate should remain idempotent"),
+            InboundEventRecordStatus::Duplicate
+        );
+        assert!(
+            store
+                .load()
+                .expect("state should load")
+                .queued_messages()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn claim_message_batch_removes_only_the_bounded_batch_prefix() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let (store, session_id) = state_store_with_session("queue-claim-bounded", "chat:a");
+        for index in 0..3 {
+            store
+                .persist_inbound_event(&message_event(
+                    &format!("evt_{index}"),
+                    &format!("msg_{index}"),
+                    &session_id,
+                    FUTURE_UNIX + index,
+                ))
+                .expect("message should persist");
+        }
+
+        let MessageBatchClaimOutcome::Claimed { input, .. } = store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(60, 2).expect("valid policy"),
+                FUTURE_UNIX + 1,
+            )
+            .expect("full bounded batch should claim")
+        else {
+            panic!("bounded batch should be claimed");
+        };
+
+        let claimed_ids = input
+            .messages()
+            .iter()
+            .map(|message| message.event_id().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(claimed_ids, ["evt_0", "evt_1"]);
+        let state = store.load().expect("state should load");
+        assert_eq!(state.queued_messages().len(), 1);
+        assert_eq!(state.queued_messages()[0].event_id().as_str(), "evt_2");
+    }
+
+    #[test]
+    fn claim_message_batch_skips_scopes_with_active_runs() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let path = test_path("queue-claim-active-scope").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let blocked = Session::new(SessionScope::new("lark", "chat:blocked").expect("valid scope"));
+        let eligible =
+            Session::new(SessionScope::new("lark", "chat:eligible").expect("valid scope"));
+        let blocked_id = blocked.id().clone();
+        let eligible_id = eligible.id().clone();
+        let mut state = RuntimeState::new();
+        state.upsert_session(blocked);
+        state.upsert_session(eligible);
+        state
+            .add_run(RunRecord::new(
+                RunId::new("run_active").expect("valid run id"),
+                blocked_id.clone(),
+                FUTURE_UNIX,
+            ))
+            .expect("active run should be accepted");
+        store.save(&state).expect("initial state should save");
+        store
+            .persist_inbound_event(&message_event(
+                "evt_blocked",
+                "msg_blocked",
+                &blocked_id,
+                FUTURE_UNIX,
+            ))
+            .expect("blocked message should persist");
+        store
+            .persist_inbound_event(&message_event(
+                "evt_eligible",
+                "msg_eligible",
+                &eligible_id,
+                FUTURE_UNIX,
+            ))
+            .expect("eligible message should persist");
+        let policy = MessageQueuePolicy::new(0, 10).expect("valid policy");
+
+        let MessageBatchClaimOutcome::Claimed { input, .. } = store
+            .claim_message_batch(
+                RunId::new("run_new").expect("valid run id"),
+                &policy,
+                FUTURE_UNIX,
+            )
+            .expect("eligible scope should claim")
+        else {
+            panic!("eligible scope should produce a claim");
+        };
+
+        assert_eq!(input.session_id(), &eligible_id);
+        let queued = store.load().expect("state should load");
+        assert_eq!(queued.queued_messages().len(), 1);
+        assert_eq!(queued.queued_messages()[0].session_id(), &blocked_id);
+    }
+
+    #[test]
+    fn terminal_run_releases_scope_for_the_next_claim() {
+        const FUTURE_UNIX: u64 = 4_102_444_800;
+
+        let (store, session_id) = state_store_with_session("queue-claim-release", "chat:a");
+        let policy = MessageQueuePolicy::new(0, 1).expect("valid policy");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, FUTURE_UNIX))
+            .expect("first message should persist");
+        let first_run_id = RunId::new("run_1").expect("valid run id");
+        assert!(matches!(
+            store
+                .claim_message_batch(first_run_id.clone(), &policy, FUTURE_UNIX)
+                .expect("first message should claim"),
+            MessageBatchClaimOutcome::Claimed { .. }
+        ));
+        store
+            .persist_inbound_event(&message_event(
+                "evt_2",
+                "msg_2",
+                &session_id,
+                FUTURE_UNIX + 1,
+            ))
+            .expect("second message should persist");
+        assert_eq!(
+            store
+                .claim_message_batch(
+                    RunId::new("run_2").expect("valid run id"),
+                    &policy,
+                    FUTURE_UNIX + 1,
+                )
+                .expect("blocked scope should return waiting"),
+            MessageBatchClaimOutcome::Waiting {
+                next_ready_at_unix: None
+            }
+        );
+
+        let mut state = store.load().expect("state should load");
+        state
+            .fail_run(&first_run_id, FUTURE_UNIX + 1)
+            .expect("first run should become terminal");
+        store.save(&state).expect("terminal run should persist");
+
+        assert!(matches!(
+            store
+                .claim_message_batch(
+                    RunId::new("run_2").expect("valid run id"),
+                    &policy,
+                    FUTURE_UNIX + 1,
+                )
+                .expect("released scope should claim"),
+            MessageBatchClaimOutcome::Claimed { .. }
+        ));
+    }
+
+    #[test]
+    fn claim_pre_replace_failure_leaves_queue_without_a_run_handoff() {
+        let (store, session_id) = state_store_with_session("queue-claim-pre-failure", "chat:a");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, 10))
+            .expect("message should persist");
+        let queued_at =
+            store.load().expect("state should load").queued_messages()[0].enqueued_at_unix();
+        fail_next_write_before_replace(store.path());
+
+        let err = store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect_err("failed persistence must not return a claim");
+
+        assert!(err.contains("failed to save runtime state"));
+        let state = store.load().expect("previous state should remain readable");
+        assert_eq!(state.queued_messages().len(), 1);
+        assert!(state.runs().is_empty());
+        assert!(state.run_inputs().is_empty());
+    }
+
+    #[test]
+    fn claim_post_replace_failure_keeps_durable_run_input_without_handoff() {
+        let (store, session_id) = state_store_with_session("queue-claim-post-failure", "chat:a");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, 10))
+            .expect("message should persist");
+        let queued_at =
+            store.load().expect("state should load").queued_messages()[0].enqueued_at_unix();
+        let run_id = RunId::new("run_1").expect("valid run id");
+        fail_next_write_after_replace(store.path());
+
+        let err = store
+            .claim_message_batch(
+                run_id.clone(),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect_err("ambiguous persistence must not return a claim");
+
+        assert!(err.contains("failed to save runtime state"));
+        let state = store.load().expect("replaced state should remain readable");
+        assert!(state.queued_messages().is_empty());
+        assert!(state.run(&run_id).is_some());
+        assert!(state.run_input(&run_id).is_some());
+    }
+
+    #[test]
+    fn stale_snapshot_after_claim_does_not_restore_claimed_messages() {
+        let (store, session_id) = state_store_with_session("queue-claim-stale-save", "chat:a");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, 10))
+            .expect("message should persist");
+        let stale = store.load().expect("stale state should load");
+        let queued_at = stale.queued_messages()[0].enqueued_at_unix();
+        let run_id = RunId::new("run_1").expect("valid run id");
+        store
+            .claim_message_batch(
+                run_id.clone(),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect("message should claim");
+
+        store
+            .save(&stale)
+            .expect("stale save should preserve durable claim ownership");
+
+        let state = store.load().expect("state should load");
+        assert!(state.queued_messages().is_empty());
+        assert!(state.run(&run_id).is_some());
+        assert!(state.run_input(&run_id).is_some());
+    }
+
+    #[test]
+    fn snapshot_save_cannot_introduce_claimed_run_inputs() {
+        let (store, session_id) = state_store_with_session("queue-claim-save-owner", "chat:a");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, 10))
+            .expect("message should persist");
+        let queued_at =
+            store.load().expect("state should load").queued_messages()[0].enqueued_at_unix();
+        store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect("message should claim");
+        let claimed = store.load().expect("claimed state should load");
+        let copy =
+            StateStore::new(test_path("queue-claim-save-owner-copy").join("runtime.state.json"));
+
+        let err = copy
+            .save(&claimed)
+            .expect_err("snapshot save must not synthesize claim ownership");
+
+        assert!(err.contains("cannot introduce run input"));
+        assert!(!copy.path().exists());
+    }
+
+    #[test]
+    fn concurrent_claims_return_only_one_run_handoff() {
+        let (store, session_id) = state_store_with_session("queue-concurrent-claim", "chat:a");
+        store
+            .persist_inbound_event(&message_event("evt_1", "msg_1", &session_id, 10))
+            .expect("message should persist");
+        let queued_at =
+            store.load().expect("state should load").queued_messages()[0].enqueued_at_unix();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = ["run_1", "run_2"].map(|id| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                store.claim_message_batch(
+                    RunId::new(id).expect("valid run id"),
+                    &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                    queued_at,
+                )
+            })
+        });
+        barrier.wait();
+
+        let outcomes = handles.map(|handle| {
+            handle
+                .join()
+                .expect("claim worker should not panic")
+                .expect("claim worker should complete")
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, MessageBatchClaimOutcome::Claimed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, MessageBatchClaimOutcome::Waiting { .. }))
+                .count(),
+            1
+        );
+        let state = store.load().expect("state should load");
+        assert!(state.queued_messages().is_empty());
+        assert_eq!(state.run_inputs().len(), 1);
+        assert_eq!(state.runs().len(), 1);
     }
 
     #[test]

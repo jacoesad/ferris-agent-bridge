@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use super::{
     event::{Event, EventId, EventKind, EventSource},
     message::{Message, MessageAuthor},
+    run::{RunId, RunRecord},
     session::SessionId,
 };
 
@@ -141,6 +142,149 @@ pub struct MessageBatch {
     ready_at_unix: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunInputRecord {
+    run_id: RunId,
+    session_id: SessionId,
+    messages: Vec<QueuedMessage>,
+    ready_at_unix: u64,
+    claimed_at_unix: u64,
+}
+
+impl RunInputRecord {
+    pub(crate) fn from_batch(
+        run_id: RunId,
+        batch: &MessageBatch,
+        claimed_at_unix: u64,
+    ) -> Result<Self, String> {
+        let record = Self {
+            run_id,
+            session_id: batch.session_id.clone(),
+            messages: batch.messages.clone(),
+            ready_at_unix: batch.ready_at_unix,
+            claimed_at_unix,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn messages(&self) -> &[QueuedMessage] {
+        &self.messages
+    }
+
+    pub fn ready_at_unix(&self) -> u64 {
+        self.ready_at_unix
+    }
+
+    pub fn claimed_at_unix(&self) -> u64 {
+        self.claimed_at_unix
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.messages.is_empty() {
+            return Err(format!("run input {} must contain messages", self.run_id));
+        }
+
+        if self.claimed_at_unix < self.ready_at_unix {
+            return Err(format!(
+                "run input {} has claimed_at_unix before ready_at_unix",
+                self.run_id
+            ));
+        }
+
+        let mut event_ids = BTreeSet::new();
+        let mut previous_enqueued_at = None;
+        for message in &self.messages {
+            message.validate()?;
+            if message.session_id() != &self.session_id {
+                return Err(format!(
+                    "run input {} contains message for session {} instead of {}",
+                    self.run_id,
+                    message.session_id(),
+                    self.session_id
+                ));
+            }
+            if !event_ids.insert(message.event_id()) {
+                return Err(format!(
+                    "run input {} contains duplicate event {}",
+                    self.run_id,
+                    message.event_id()
+                ));
+            }
+            if let Some(previous) = previous_enqueued_at {
+                if message.enqueued_at_unix() < previous {
+                    return Err(format!(
+                        "run input {} messages are not ordered by enqueued_at_unix",
+                        self.run_id
+                    ));
+                }
+            }
+            previous_enqueued_at = Some(message.enqueued_at_unix());
+        }
+
+        let last_enqueued_at = self
+            .messages
+            .last()
+            .expect("non-empty run input must have a last message")
+            .enqueued_at_unix();
+        if self.ready_at_unix < last_enqueued_at {
+            return Err(format!(
+                "run input {} has ready_at_unix before its last message",
+                self.run_id
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for RunInputRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RunInputRecordWire {
+            run_id: RunId,
+            session_id: SessionId,
+            messages: Vec<QueuedMessage>,
+            ready_at_unix: u64,
+            claimed_at_unix: u64,
+        }
+
+        let wire = RunInputRecordWire::deserialize(deserializer)?;
+        let record = Self {
+            run_id: wire.run_id,
+            session_id: wire.session_id,
+            messages: wire.messages,
+            ready_at_unix: wire.ready_at_unix,
+            claimed_at_unix: wire.claimed_at_unix,
+        };
+        record.validate().map_err(de::Error::custom)?;
+        Ok(record)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageBatchClaimOutcome {
+    Claimed {
+        run: RunRecord,
+        input: RunInputRecord,
+    },
+    Waiting {
+        next_ready_at_unix: Option<u64>,
+    },
+}
+
 impl MessageBatch {
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
@@ -192,8 +336,23 @@ impl MessageQueuePolicy {
         queued_messages: &[QueuedMessage],
         now_unix: u64,
     ) -> MessageQueuePoll {
+        self.poll_where(queued_messages, now_unix, |_| true)
+    }
+
+    pub(crate) fn poll_where<F>(
+        &self,
+        queued_messages: &[QueuedMessage],
+        now_unix: u64,
+        mut is_eligible: F,
+    ) -> MessageQueuePoll
+    where
+        F: FnMut(&SessionId) -> bool,
+    {
         let mut by_session: BTreeMap<&SessionId, Vec<&QueuedMessage>> = BTreeMap::new();
         for queued in queued_messages {
+            if !is_eligible(queued.session_id()) {
+                continue;
+            }
             by_session
                 .entry(queued.session_id())
                 .or_default()

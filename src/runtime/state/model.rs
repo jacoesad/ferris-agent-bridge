@@ -11,7 +11,10 @@ use crate::runtime::{
         OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
         OutboundDeliveryStatus,
     },
-    queue::{MessageQueuePolicy, MessageQueuePoll, QueuedMessage},
+    queue::{
+        MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
+        RunInputRecord,
+    },
     run::{RunId, RunRecord},
     session::{Session, SessionId},
 };
@@ -20,10 +23,22 @@ use crate::runtime::{
 pub struct RuntimeState {
     sessions: Vec<Session>,
     runs: Vec<RunRecord>,
+    run_inputs: Vec<RunInputRecord>,
     inbound_events: Vec<InboundEventRecord>,
     queued_messages: Vec<QueuedMessage>,
     outbound_deliveries: Vec<OutboundDeliveryRecord>,
     updated_at_unix: u64,
+}
+
+pub(in crate::runtime::state) struct PersistedStateParts {
+    pub(in crate::runtime::state) sessions: Vec<Session>,
+    pub(in crate::runtime::state) runs: Vec<RunRecord>,
+    pub(in crate::runtime::state) run_inputs: Vec<RunInputRecord>,
+    pub(in crate::runtime::state) inbound_events: Vec<InboundEventRecord>,
+    pub(in crate::runtime::state) queued_messages: Vec<QueuedMessage>,
+    pub(in crate::runtime::state) outbound_deliveries: Vec<OutboundDeliveryRecord>,
+    pub(in crate::runtime::state) updated_at_unix: u64,
+    pub(in crate::runtime::state) normalize_aggregate_updated_at: bool,
 }
 
 impl RuntimeState {
@@ -31,6 +46,7 @@ impl RuntimeState {
         Self {
             sessions: Vec::new(),
             runs: Vec::new(),
+            run_inputs: Vec::new(),
             inbound_events: Vec::new(),
             queued_messages: Vec::new(),
             outbound_deliveries: Vec::new(),
@@ -88,6 +104,10 @@ impl RuntimeState {
         self.runs.iter().find(|run| run.id() == id)
     }
 
+    pub fn run_input(&self, id: &RunId) -> Option<&RunInputRecord> {
+        self.run_inputs.iter().find(|input| input.run_id() == id)
+    }
+
     pub fn record_inbound_event(
         &mut self,
         event: &Event,
@@ -113,6 +133,45 @@ impl RuntimeState {
         now_unix: u64,
     ) -> MessageQueuePoll {
         policy.poll(&self.queued_messages, now_unix)
+    }
+
+    pub(super) fn claim_message_batch(
+        &mut self,
+        run_id: RunId,
+        policy: &MessageQueuePolicy,
+        now_unix: u64,
+    ) -> Result<MessageBatchClaimOutcome, String> {
+        let active_sessions = self
+            .runs
+            .iter()
+            .filter(|run| !run.is_terminal())
+            .map(RunRecord::session_id)
+            .collect::<BTreeSet<_>>();
+        let poll = policy.poll_where(&self.queued_messages, now_unix, |session_id| {
+            !active_sessions.contains(session_id)
+        });
+        let batch = match poll {
+            MessageQueuePoll::Ready(batch) => batch,
+            MessageQueuePoll::Waiting { next_ready_at_unix } => {
+                return Ok(MessageBatchClaimOutcome::Waiting { next_ready_at_unix });
+            }
+        };
+
+        let run = RunRecord::new(run_id.clone(), batch.session_id().clone(), now_unix);
+        let input = RunInputRecord::from_batch(run_id, &batch, now_unix)?;
+        let claimed_event_ids = input
+            .messages()
+            .iter()
+            .map(|message| message.event_id().clone())
+            .collect::<BTreeSet<_>>();
+
+        self.add_run(run.clone())?;
+        self.queued_messages
+            .retain(|queued| !claimed_event_ids.contains(queued.event_id()));
+        self.run_inputs.push(input.clone());
+        self.touch_at(input.claimed_at_unix());
+
+        Ok(MessageBatchClaimOutcome::Claimed { run, input })
     }
 
     pub fn enqueue_outbound_delivery(
@@ -276,6 +335,10 @@ impl RuntimeState {
         &self.runs
     }
 
+    pub fn run_inputs(&self) -> &[RunInputRecord] {
+        &self.run_inputs
+    }
+
     pub fn inbound_events(&self) -> &[InboundEventRecord] {
         &self.inbound_events
     }
@@ -291,6 +354,7 @@ impl RuntimeState {
     pub fn validate(&self) -> Result<(), String> {
         let mut session_ids = BTreeSet::new();
         let mut run_ids = BTreeSet::new();
+        let mut run_input_ids = BTreeSet::new();
         let mut active_run_by_session = BTreeMap::new();
         let mut inbound_event_positions = BTreeMap::new();
         let mut queued_event_ids = BTreeSet::new();
@@ -449,27 +513,103 @@ impl RuntimeState {
             }
         }
 
+        let mut claimed_event_ids = BTreeSet::new();
+        for input in &self.run_inputs {
+            input.validate()?;
+            if !run_input_ids.insert(input.run_id()) {
+                return Err(format!("duplicate run input id {}", input.run_id()));
+            }
+
+            let run = self
+                .run(input.run_id())
+                .ok_or_else(|| format!("run input {} references unknown run", input.run_id()))?;
+            if run.session_id() != input.session_id() {
+                return Err(format!(
+                    "run input {} does not match run session {}",
+                    input.run_id(),
+                    run.session_id()
+                ));
+            }
+            if run.created_at_unix() != input.claimed_at_unix() {
+                return Err(format!(
+                    "run input {} claimed_at_unix does not match run created_at_unix",
+                    input.run_id()
+                ));
+            }
+
+            let mut previous_inbound_position = None;
+            for message in input.messages() {
+                if queued_event_ids.contains(message.event_id()) {
+                    return Err(format!(
+                        "run input {} event {} is still present in the message queue",
+                        input.run_id(),
+                        message.event_id()
+                    ));
+                }
+                if !claimed_event_ids.insert(message.event_id()) {
+                    return Err(format!(
+                        "queued message event {} is claimed by multiple runs",
+                        message.event_id()
+                    ));
+                }
+
+                let inbound_position = *inbound_event_positions
+                    .get(message.event_id())
+                    .ok_or_else(|| {
+                        format!(
+                            "run input {} message event {} has no inbound event record",
+                            input.run_id(),
+                            message.event_id()
+                        )
+                    })?;
+                let inbound_event = &self.inbound_events[inbound_position];
+                if message.received_at_unix() != inbound_event.received_at_unix() {
+                    return Err(format!(
+                        "run input {} message event {} does not match inbound event received_at_unix",
+                        input.run_id(),
+                        message.event_id()
+                    ));
+                }
+                if message.enqueued_at_unix() < inbound_event.recorded_at_unix() {
+                    return Err(format!(
+                        "run input {} message event {} was enqueued before its inbound event record",
+                        input.run_id(),
+                        message.event_id()
+                    ));
+                }
+                if let Some(previous_position) = previous_inbound_position {
+                    if inbound_position <= previous_position {
+                        return Err(format!(
+                            "run input {} messages are out of inbound ledger order",
+                            input.run_id()
+                        ));
+                    }
+                }
+                previous_inbound_position = Some(inbound_position);
+            }
+
+            if self.updated_at_unix < input.claimed_at_unix() {
+                return Err(format!(
+                    "runtime state updated_at_unix before run input {} claimed_at_unix",
+                    input.run_id()
+                ));
+            }
+        }
+
         Ok(())
     }
 
-    pub(super) fn from_persisted_parts(
-        sessions: Vec<Session>,
-        runs: Vec<RunRecord>,
-        inbound_events: Vec<InboundEventRecord>,
-        queued_messages: Vec<QueuedMessage>,
-        outbound_deliveries: Vec<OutboundDeliveryRecord>,
-        updated_at_unix: u64,
-        normalize_aggregate_updated_at: bool,
-    ) -> Result<Self, String> {
+    pub(super) fn from_persisted_parts(parts: PersistedStateParts) -> Result<Self, String> {
         let mut state = Self {
-            sessions,
-            runs,
-            inbound_events,
-            queued_messages,
-            outbound_deliveries,
-            updated_at_unix,
+            sessions: parts.sessions,
+            runs: parts.runs,
+            run_inputs: parts.run_inputs,
+            inbound_events: parts.inbound_events,
+            queued_messages: parts.queued_messages,
+            outbound_deliveries: parts.outbound_deliveries,
+            updated_at_unix: parts.updated_at_unix,
         };
-        if normalize_aggregate_updated_at {
+        if parts.normalize_aggregate_updated_at {
             state.normalize_migrated_aggregate_updated_at();
         }
         state.validate()?;
@@ -534,13 +674,10 @@ impl RuntimeState {
                 ));
             }
 
-            let existing_queued = self
-                .queued_messages
-                .iter()
-                .find(|queued| queued.event_id() == &event.id);
-            match (existing_queued, queued.as_ref()) {
-                (Some(existing_queued), Some(candidate_queued)) => {
-                    if !existing_queued.has_same_identity(candidate_queued) {
+            let existing_message = self.message_record_for_event(&event.id);
+            match (existing_message, queued.as_ref()) {
+                (Some(existing_message), Some(candidate_queued)) => {
+                    if !existing_message.has_same_identity(candidate_queued) {
                         return Err(format!("conflicting queued message event {}", event.id));
                     }
                 }
@@ -614,6 +751,7 @@ impl RuntimeState {
             .iter()
             .map(Session::updated_at_unix)
             .chain(self.runs.iter().map(RunRecord::updated_at_unix))
+            .chain(self.run_inputs.iter().map(RunInputRecord::claimed_at_unix))
             .chain(
                 self.inbound_events
                     .iter()
@@ -652,17 +790,11 @@ impl RuntimeState {
                 ));
             }
 
-            let existing_queued = existing
-                .queued_messages
-                .iter()
-                .find(|queued| queued.event_id() == candidate_event.id());
-            let candidate_queued = self
-                .queued_messages
-                .iter()
-                .find(|queued| queued.event_id() == candidate_event.id());
-            match (existing_queued, candidate_queued) {
-                (Some(existing_queued), Some(candidate_queued))
-                    if existing_queued.has_same_identity(candidate_queued) => {}
+            let existing_message = existing.message_record_for_event(candidate_event.id());
+            let candidate_message = self.message_record_for_event(candidate_event.id());
+            match (existing_message, candidate_message) {
+                (Some(existing_message), Some(candidate_message))
+                    if existing_message.has_same_identity(candidate_message) => {}
                 (None, None) => {}
                 _ => {
                     return Err(format!(
@@ -728,6 +860,35 @@ impl RuntimeState {
         Ok(())
     }
 
+    pub(super) fn preserve_run_inputs_from(
+        &mut self,
+        existing: &RuntimeState,
+    ) -> Result<(), String> {
+        let mut merged = existing.run_inputs.clone();
+        for candidate_input in &self.run_inputs {
+            match existing
+                .run_inputs
+                .iter()
+                .find(|input| input.run_id() == candidate_input.run_id())
+            {
+                Some(existing_input) if existing_input == candidate_input => {}
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting run input record {}",
+                        candidate_input.run_id()
+                    ));
+                }
+                None => merged.push(candidate_input.clone()),
+            }
+        }
+        for input in &merged {
+            self.touch_at(input.claimed_at_unix());
+        }
+        self.run_inputs = merged;
+
+        Ok(())
+    }
+
     pub(super) fn preserve_outbound_deliveries_from(
         &mut self,
         existing: &RuntimeState,
@@ -761,13 +922,35 @@ impl RuntimeState {
         &mut self,
         existing: &RuntimeState,
     ) -> Result<(), String> {
-        let mut merged = existing.queued_messages.clone();
+        let mut merged = Vec::new();
+        for existing_queued in &existing.queued_messages {
+            match self.claimed_message_for_event(existing_queued.event_id()) {
+                Some(claimed) if claimed.has_same_identity(existing_queued) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting claimed message event {}",
+                        existing_queued.event_id()
+                    ));
+                }
+                None => merged.push(existing_queued.clone()),
+            }
+        }
         let mut last_queued_at_by_session = BTreeMap::new();
         for queued in &merged {
             last_queued_at_by_session
                 .insert(queued.session_id().clone(), queued.enqueued_at_unix());
         }
         for candidate_queued in &self.queued_messages {
+            match self.claimed_message_for_event(candidate_queued.event_id()) {
+                Some(claimed) if claimed.has_same_identity(candidate_queued) => continue,
+                Some(_) => {
+                    return Err(format!(
+                        "conflicting claimed message event {}",
+                        candidate_queued.event_id()
+                    ));
+                }
+                None => {}
+            }
             match existing
                 .queued_messages
                 .iter()
@@ -802,6 +985,20 @@ impl RuntimeState {
 
         Ok(())
     }
+
+    fn claimed_message_for_event(&self, id: &EventId) -> Option<&QueuedMessage> {
+        self.run_inputs
+            .iter()
+            .flat_map(|input| input.messages())
+            .find(|message| message.event_id() == id)
+    }
+
+    fn message_record_for_event(&self, id: &EventId) -> Option<&QueuedMessage> {
+        self.queued_messages
+            .iter()
+            .find(|message| message.event_id() == id)
+            .or_else(|| self.claimed_message_for_event(id))
+    }
 }
 
 impl Default for RuntimeState {
@@ -820,6 +1017,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
         struct RuntimeStateWire {
             sessions: Vec<Session>,
             runs: Vec<RunRecord>,
+            run_inputs: Vec<RunInputRecord>,
             inbound_events: Vec<InboundEventRecord>,
             queued_messages: Vec<QueuedMessage>,
             outbound_deliveries: Vec<OutboundDeliveryRecord>,
@@ -830,6 +1028,7 @@ impl<'de> Deserialize<'de> for RuntimeState {
         let state = Self {
             sessions: wire.sessions,
             runs: wire.runs,
+            run_inputs: wire.run_inputs,
             inbound_events: wire.inbound_events,
             queued_messages: wire.queued_messages,
             outbound_deliveries: wire.outbound_deliveries,
@@ -870,6 +1069,7 @@ mod tests {
         assert!(encoded.get("version").is_none());
         assert!(encoded.get("sessions").is_some());
         assert!(encoded.get("runs").is_some());
+        assert!(encoded.get("run_inputs").is_some());
         assert!(encoded.get("inbound_events").is_some());
         assert!(encoded.get("queued_messages").is_some());
         assert!(encoded.get("outbound_deliveries").is_some());
@@ -882,6 +1082,7 @@ mod tests {
             "version": 1,
             "sessions": [],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "outbound_deliveries": [],
             "updated_at_unix": 1
