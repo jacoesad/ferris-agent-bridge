@@ -1,4 +1,4 @@
-use crate::runtime::run::RunStartupRecoveryReport;
+use crate::runtime::{persistence::confirm_existing_file_durable, run::RunStartupRecoveryReport};
 
 use super::StateStore;
 
@@ -12,6 +12,13 @@ impl StateStore {
         let (report, changed) = state.reconcile_runs_at_startup(recovered_at_unix)?;
         if changed {
             self.write_unlocked(&state)?;
+        } else {
+            confirm_existing_file_durable(self.path()).map_err(|err| {
+                format!(
+                    "failed to confirm runtime state {} durability: {err}",
+                    self.path().display()
+                )
+            })?;
         }
 
         Ok(report)
@@ -31,7 +38,9 @@ mod tests {
     use crate::runtime::{
         event::{Event, EventId, EventKind, EventSource},
         message::Message,
-        persistence::{fail_next_write_after_replace, fail_next_write_before_replace},
+        persistence::{
+            fail_next_parent_sync, fail_next_write_after_replace, fail_next_write_before_replace,
+        },
         queue::{MessageBatchClaimOutcome, MessageQueuePolicy},
         run::{RunId, RunRecord, RunStatus},
         session::{Session, SessionId, SessionScope},
@@ -251,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_post_replace_failure_rebuilds_report() {
+    fn startup_recovery_post_replace_failure_reestablishes_durability() {
         let (store, run_id, started_at) = state_store_with_running_run("run-recovery-post-failure");
         fail_next_write_after_replace(store.path());
 
@@ -269,9 +278,15 @@ mod tests {
                 .status(),
             RunStatus::Interrupted
         );
+        fail_next_parent_sync(store.path());
+        let retry_err = store
+            .reconcile_runs_at_startup(started_at + 2)
+            .expect_err("retry must confirm the visible replacement is durable");
+        assert!(retry_err.contains("failed to confirm runtime state"));
+
         let retried = store
             .reconcile_runs_at_startup(started_at + 2)
-            .expect("retry should rebuild the report from durable interruption");
+            .expect("retry should rebuild the report after confirming durability");
         assert_eq!(retried.interrupted_run_ids(), &[run_id]);
     }
 

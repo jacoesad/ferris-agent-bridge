@@ -24,6 +24,9 @@ static FAIL_BEFORE_REPLACE_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock:
 #[cfg(test)]
 static FAIL_AFTER_REPLACE_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
+#[cfg(test)]
+static FAIL_PARENT_SYNC_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
 pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let input = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
@@ -66,6 +69,14 @@ pub(super) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Res
     write_result
 }
 
+pub(super) fn confirm_existing_file_durable(path: &Path) -> io::Result<()> {
+    if path.try_exists()? {
+        sync_parent(path)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn fail_next_write_before_replace(path: &Path) {
     fail_before_replace_paths()
@@ -77,6 +88,14 @@ pub(super) fn fail_next_write_before_replace(path: &Path) {
 #[cfg(test)]
 pub(super) fn fail_next_write_after_replace(path: &Path) {
     fail_after_replace_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_parent_sync(path: &Path) {
+    fail_parent_sync_paths()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(path.to_path_buf());
@@ -99,6 +118,14 @@ fn take_fail_after_replace(path: &Path) -> bool {
 }
 
 #[cfg(test)]
+fn take_fail_parent_sync(path: &Path) -> bool {
+    fail_parent_sync_paths()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path)
+}
+
+#[cfg(test)]
 fn fail_before_replace_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
     FAIL_BEFORE_REPLACE_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
@@ -106,6 +133,11 @@ fn fail_before_replace_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
 #[cfg(test)]
 fn fail_after_replace_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
     FAIL_AFTER_REPLACE_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn fail_parent_sync_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    FAIL_PARENT_SYNC_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
 #[cfg(not(windows))]
@@ -159,17 +191,20 @@ fn temp_path_for(path: &Path) -> PathBuf {
     ))
 }
 
-#[cfg(unix)]
 fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if take_fail_parent_sync(path) {
+        return Err(io::Error::other("injected parent directory sync failure"));
+    }
+
+    #[cfg(unix)]
     if let Some(parent) = non_empty_parent(path) {
         File::open(parent)?.sync_all()?;
     }
 
-    Ok(())
-}
+    #[cfg(not(unix))]
+    let _ = path;
 
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
