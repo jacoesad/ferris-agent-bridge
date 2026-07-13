@@ -107,6 +107,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - 剩余 `ImAdapter` 能力和 `AgentAdapter` capability traits
 - 具体 runtime orchestrator，用于串联 storage、queues、policies 和 adapter boundaries
 - Runtime-level tests，证明 duplicate handling、queueing、recovery 和 policy decisions
+- Release 前的 runtime state schema compatibility consolidation：在只包含 metadata 的 release PR 前移除 milestone 开发期未发布的中间 schema
 
 ## Milestone 4: First Agent Adapter
 

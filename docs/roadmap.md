@@ -107,6 +107,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Remaining `ImAdapter` capabilities and `AgentAdapter` capability traits
 - Concrete runtime orchestrator that wires storage, queues, policies, and adapter boundaries
 - Runtime-level tests that prove duplicate handling, queueing, recovery, and policy decisions
+- Pre-release runtime state schema compatibility consolidation that removes unreleased milestone-intermediate schemas before the metadata-only release PR
 
 ## Milestone 4: First Agent Adapter
 

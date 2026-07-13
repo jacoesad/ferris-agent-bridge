@@ -82,6 +82,8 @@ Release PRs should contain only release preparation changes:
 - update `CHANGELOG.md` or release notes
 - make small package metadata or README fixes needed for publishing
 
+If a milestone introduced intermediate runtime state schemas, complete their compatibility consolidation in a separate PR before cutting the release branch. Remove only schemas that were never written by a tagged release, preserve supported tagged-release upgrade paths, and keep schema numbers monotonic. See [Runtime State Schema Evolution](docs/architecture.md#runtime-state-schema-evolution) for the full policy.
+
 Release PRs should run the normal CI checks plus release dry-run verification such as `cargo package` and `cargo publish --dry-run`.
 
 After the release PR is merged back to `main`, tag the resulting `main` commit and publish from that commit. Do not tag or publish from the release branch before it is merged.
@@ -90,16 +92,17 @@ Keep annotated tag messages short, for example `Release v0.1.0`. Put release hig
 
 Current manual release flow:
 
-1. Cut a short `release/<version>` branch from the latest `main`.
-2. Make release-only changes, such as version, metadata, README, or release notes updates.
-3. Open a release PR and wait for CI and release dry-run checks to pass.
-4. Merge the release PR back to `main`.
-5. Update local `main` to the merged commit.
-6. Verify the merged commit with `cargo publish --dry-run`.
-7. Create and push an annotated tag, for example `v0.1.0`.
-8. Run `cargo publish` from the tagged `main` commit.
-9. Confirm the crate version is visible on crates.io.
-10. Create a GitHub Release from the pushed tag, using the matching `CHANGELOG.md` section as the release notes.
-11. Delete the release branch when it is no longer useful.
+1. If needed, complete and merge a separate runtime state schema compatibility-consolidation PR.
+2. Cut a short `release/<version>` branch from the latest `main`.
+3. Make release-only changes, such as version, metadata, README, or release notes updates.
+4. Open a release PR and wait for CI and release dry-run checks to pass.
+5. Merge the release PR back to `main`.
+6. Update local `main` to the merged commit.
+7. Verify the merged commit with `cargo publish --dry-run`.
+8. Create and push an annotated tag, for example `v0.1.0`.
+9. Run `cargo publish` from the tagged `main` commit.
+10. Confirm the crate version is visible on crates.io.
+11. Create a GitHub Release from the pushed tag, using the matching `CHANGELOG.md` section as the release notes.
+12. Delete the release branch when it is no longer useful.
 
 Trusted publishing and tag-triggered release automation may be added later.

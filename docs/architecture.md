@@ -151,6 +151,16 @@ Responsibilities:
 - State storage and service locks.
 - Routing and orchestration between normalized IM events and agent events.
 
+## Runtime State Schema Evolution
+
+The runtime state schema version is an internal persisted-data compatibility marker. It is independent of the crate version and release version. Runtime state contains durable ownership, deduplication, queue, run, and delivery information, so it must not be treated as a disposable cache.
+
+- Increment the schema version when the serialized representation or durable meaning changes incompatibly. Refactors, tests, documentation, and compatible field handling do not require a new schema version.
+- Keep schema numbers monotonic and never reuse a number, including numbers used only by development snapshots.
+- During milestone development, readers for intermediate schemas may remain on `main` so persisted state written by those snapshots can migrate forward.
+- Before a milestone release, use a separate compatibility-consolidation PR to remove migration paths only for intermediate schemas that were never written by a tagged release. Retain migration paths for supported tagged-release schemas and the final schema being released. Complete this before cutting the release branch so the release PR remains limited to release preparation.
+- Reject unsupported or future schema versions with a clear error. Never silently delete, downgrade, or reinterpret persisted state.
+
 ## Agent Adapters
 
 Agent adapters run local CLI tools and convert their output into a common `AgentEvent` stream.

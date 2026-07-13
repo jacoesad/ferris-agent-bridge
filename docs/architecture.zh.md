@@ -151,6 +151,16 @@ Core runtime 拥有不应依赖任何单一 IM 平台或 agent CLI 的行为。
 - State storage 和 service locks。
 - 在 normalized IM events 与 agent events 之间进行 routing 和 orchestration。
 
+## Runtime State Schema 演进
+
+Runtime state schema version 是内部持久化数据的兼容性标记，与 crate version 和 release version 相互独立。Runtime state 包含 durable ownership、去重、队列、run 和 delivery 信息，因此不能把它当作可随意丢弃的 cache。
+
+- 当序列化表示或持久化语义发生不兼容变化时递增 schema version。Refactor、测试、文档和兼容的字段处理不需要新的 schema version。
+- Schema 编号必须单调递增且不得复用，包括只在开发快照中使用过的编号。
+- 在 milestone 开发期间，可以暂时在 `main` 保留中间 schema reader，使这些开发快照写入的持久化状态可以向前迁移。
+- 在 milestone 发布前，使用独立的 compatibility consolidation PR，仅移除从未由 tagged release 写入的中间 schema migration path。保留受支持 tagged-release schema 和即将发布的最终 schema 的 migration path。该工作应在切 release branch 前完成，使 release PR 仍只包含发布准备变更。
+- 对不支持或来自未来版本的 schema 给出明确错误。不得静默删除、降级或重新解释持久化状态。
+
 ## Agent Adapters
 
 Agent adapters 运行本地 CLI 工具，并将其输出转换为通用 `AgentEvent` stream。
