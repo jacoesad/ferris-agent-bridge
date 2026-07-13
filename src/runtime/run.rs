@@ -66,6 +66,45 @@ pub struct RunRecord {
     finished_at_unix: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStartupRecoveryReport {
+    resumable_pending_run_ids: Vec<RunId>,
+    interrupted_run_ids: Vec<RunId>,
+    failed_run_ids: Vec<RunId>,
+}
+
+impl RunStartupRecoveryReport {
+    pub(crate) fn new(
+        resumable_pending_run_ids: Vec<RunId>,
+        interrupted_run_ids: Vec<RunId>,
+        failed_run_ids: Vec<RunId>,
+    ) -> Self {
+        Self {
+            resumable_pending_run_ids,
+            interrupted_run_ids,
+            failed_run_ids,
+        }
+    }
+
+    pub fn resumable_pending_run_ids(&self) -> &[RunId] {
+        &self.resumable_pending_run_ids
+    }
+
+    pub fn interrupted_run_ids(&self) -> &[RunId] {
+        &self.interrupted_run_ids
+    }
+
+    pub fn failed_run_ids(&self) -> &[RunId] {
+        &self.failed_run_ids
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.resumable_pending_run_ids.is_empty()
+            && self.interrupted_run_ids.is_empty()
+            && self.failed_run_ids.is_empty()
+    }
+}
+
 impl RunRecord {
     pub fn new(id: RunId, session_id: SessionId, created_at_unix: u64) -> Self {
         Self {

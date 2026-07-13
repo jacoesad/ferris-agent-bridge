@@ -28,6 +28,6 @@ pub use queue::{
     MessageBatch, MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
     RunInputRecord,
 };
-pub use run::{RunId, RunRecord, RunStatus};
+pub use run::{RunId, RunRecord, RunStartupRecoveryReport, RunStatus};
 pub use session::{Session, SessionId, SessionScope};
 pub use state::{RuntimeState, StateStore};
