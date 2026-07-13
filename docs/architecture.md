@@ -63,7 +63,9 @@ Event delivery should be modeled as a domain-level transport capability, not as 
 
 When a transport supports explicit delivery acknowledgement, the adapter should ask the runtime to persist or de-duplicate the normalized inbound event before acknowledging the platform delivery. The foundation layer provides the persistence primitive, and the initial runtime orchestrator boundary wires it through `InboundDelivery` and `ImAdapter::acknowledge_inbound_delivery`: the runtime records a new event or recognizes a duplicate before it calls the adapter acknowledgement. A session-bound inbound message is placed in its durable per-scope queue in the same state replacement as the ledger record, so acknowledgement cannot race ahead of pending work. Duplicate detection uses the normalized `EventId`, so IM adapters must namespace provider delivery identifiers by platform and scope before handing events to the runtime. A failed persistence attempt must leave the delivery unacknowledged so the platform can retry according to its own transport semantics. Real provider transports still belong inside concrete IM adapters.
 
-Queue consumption is owned by a separate durable boundary. `StateStore::claim_message_batch` selects work only for a scope without a pending or running run, then creates a pending run, persists its recoverable input messages, and removes exactly that bounded queue prefix in one atomic state replacement. The runtime returns the claim only after that replacement succeeds, so concurrent workers cannot receive the same scope or message batch inside the owned process.
+Queue consumption is owned by a separate durable boundary. `StateStore::claim_message_batch` selects work only for a scope without a pending, running, or interrupted run, then creates a pending run, persists its recoverable input messages, and removes exactly that bounded queue prefix in one atomic state replacement. The runtime returns the claim only after that replacement succeeds, so concurrent workers cannot receive the same scope or message batch inside the owned process.
+
+Run startup reconciliation is another store-owned boundary. `StateStore::reconcile_runs_at_startup` keeps pending runs with durable input resumable without returning an execution handoff, converts running or input-less pending runs into non-terminal `interrupted` ownership, and surfaces failed runs without retrying them. Interrupted runs continue excluding their scope until explicitly failed or cancelled, preventing new work from overlapping unresolved agent-side effects.
 
 Outbound delivery follows the inverse durable boundary. The runtime claims an outbox record before constructing an `OutboundDeliveryAttempt` with a stable delivery id, normalized scope, message, and attempt number. `ImAdapter::deliver_outbound_message` receives that platform-neutral attempt and must classify failures as retryable only when provider non-acceptance is known; ambiguous transport outcomes remain uncertain and are not automatically retried. Provider request types, idempotency mechanisms, and transport details remain inside the concrete adapter. The runtime records the adapter outcome before scheduling another attempt.
 
@@ -148,6 +150,16 @@ Responsibilities:
 - Run lifecycle and cancellation.
 - State storage and service locks.
 - Routing and orchestration between normalized IM events and agent events.
+
+## Runtime State Schema Evolution
+
+The runtime state schema version is an internal persisted-data compatibility marker. It is independent of the crate version and release version. Runtime state contains durable ownership, deduplication, queue, run, and delivery information, so it must not be treated as a disposable cache.
+
+- Increment the schema version when the serialized representation or durable meaning changes incompatibly. Refactors, tests, documentation, and compatible field handling do not require a new schema version.
+- Keep schema numbers monotonic and never reuse a number, including numbers used only by development snapshots.
+- During milestone development, readers for intermediate schemas may remain on `main` so persisted state written by those snapshots can migrate forward.
+- Before a milestone release, use a separate compatibility-consolidation PR to remove migration paths only for intermediate schemas that were never written by a tagged release. Retain migration paths for supported tagged-release schemas and the final schema being released. Complete this before cutting the release branch so the release PR remains limited to release preparation.
+- Reject unsupported or future schema versions with a clear error. Never silently delete, downgrade, or reinterpret persisted state.
 
 ## Agent Adapters
 

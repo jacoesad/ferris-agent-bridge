@@ -82,6 +82,8 @@ Release PR 应只包含发布准备变更：
 - 更新 `CHANGELOG.md` 或 release notes
 - 发布所需的小范围 package metadata 或 README 修正
 
+如果 milestone 引入了中间 runtime state schemas，应在切 release branch 前通过独立 PR 完成 compatibility consolidation。只移除从未由 tagged release 写入的 schema，保留受支持 tagged-release upgrade path，并确保 schema 编号单调递增。完整策略见 [Runtime State Schema 演进](docs/architecture.zh.md#runtime-state-schema-演进)。
+
 Release PR 应运行常规 CI，并完成发布 dry-run 验证，例如 `cargo package` 和 `cargo publish --dry-run`。
 
 Release PR 合并回 `main` 后，应从合并后的 `main` commit 打 tag 并发布。不要在 release 分支合并前从 release 分支打 tag 或发布。
@@ -90,16 +92,17 @@ Annotated tag message 保持简短，例如 `Release v0.1.0`。Release highlight
 
 当前手动发布流程：
 
-1. 从最新 `main` 切短生命周期的 `release/<version>` 分支。
-2. 进行仅限发布准备的变更，例如版本、metadata、README 或 release notes 更新。
-3. 打开 release PR，并等待 CI 和 release dry-run checks 通过。
-4. 将 release PR 合并回 `main`。
-5. 将本地 `main` 更新到合并后的 commit。
-6. 在合并后的 commit 上运行 `cargo publish --dry-run` 验证。
-7. 创建并推送 annotated tag，例如 `v0.1.0`。
-8. 从已打 tag 的 `main` commit 运行 `cargo publish`。
-9. 确认 crate version 已在 crates.io 可见。
-10. 基于已推送的 tag 创建 GitHub Release，并使用匹配的 `CHANGELOG.md` 小节作为 release notes。
-11. 当 release 分支不再有用时删除它。
+1. 如有需要，完成并合并独立的 runtime state schema compatibility consolidation PR。
+2. 从最新 `main` 切短生命周期的 `release/<version>` 分支。
+3. 进行仅限发布准备的变更，例如版本、metadata、README 或 release notes 更新。
+4. 打开 release PR，并等待 CI 和 release dry-run checks 通过。
+5. 将 release PR 合并回 `main`。
+6. 将本地 `main` 更新到合并后的 commit。
+7. 在合并后的 commit 上运行 `cargo publish --dry-run` 验证。
+8. 创建并推送 annotated tag，例如 `v0.1.0`。
+9. 从已打 tag 的 `main` commit 运行 `cargo publish`。
+10. 确认 crate version 已在 crates.io 可见。
+11. 基于已推送的 tag 创建 GitHub Release，并使用匹配的 `CHANGELOG.md` 小节作为 release notes。
+12. 当 release 分支不再有用时删除它。
 
 后续可以加入 trusted publishing 和 tag-triggered release automation。

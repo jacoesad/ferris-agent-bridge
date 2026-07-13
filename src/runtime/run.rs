@@ -43,6 +43,7 @@ impl<'de> Deserialize<'de> for RunId {
 pub enum RunStatus {
     Pending,
     Running,
+    Interrupted,
     Completed,
     Failed,
     Cancelled,
@@ -63,6 +64,45 @@ pub struct RunRecord {
     updated_at_unix: u64,
     started_at_unix: Option<u64>,
     finished_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStartupRecoveryReport {
+    resumable_pending_run_ids: Vec<RunId>,
+    interrupted_run_ids: Vec<RunId>,
+    failed_run_ids: Vec<RunId>,
+}
+
+impl RunStartupRecoveryReport {
+    pub(crate) fn new(
+        resumable_pending_run_ids: Vec<RunId>,
+        interrupted_run_ids: Vec<RunId>,
+        failed_run_ids: Vec<RunId>,
+    ) -> Self {
+        Self {
+            resumable_pending_run_ids,
+            interrupted_run_ids,
+            failed_run_ids,
+        }
+    }
+
+    pub fn resumable_pending_run_ids(&self) -> &[RunId] {
+        &self.resumable_pending_run_ids
+    }
+
+    pub fn interrupted_run_ids(&self) -> &[RunId] {
+        &self.interrupted_run_ids
+    }
+
+    pub fn failed_run_ids(&self) -> &[RunId] {
+        &self.failed_run_ids
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.resumable_pending_run_ids.is_empty()
+            && self.interrupted_run_ids.is_empty()
+            && self.failed_run_ids.is_empty()
+    }
 }
 
 impl RunRecord {
@@ -120,9 +160,26 @@ impl RunRecord {
         }
 
         match previous.status {
-            RunStatus::Pending => self.status != RunStatus::Pending,
+            RunStatus::Pending => matches!(
+                self.status,
+                RunStatus::Running
+                    | RunStatus::Interrupted
+                    | RunStatus::Completed
+                    | RunStatus::Failed
+                    | RunStatus::Cancelled
+            ),
             RunStatus::Running => {
-                self.status.is_terminal() && self.started_at_unix == previous.started_at_unix
+                matches!(
+                    self.status,
+                    RunStatus::Interrupted
+                        | RunStatus::Completed
+                        | RunStatus::Failed
+                        | RunStatus::Cancelled
+                ) && self.started_at_unix == previous.started_at_unix
+            }
+            RunStatus::Interrupted => {
+                matches!(self.status, RunStatus::Failed | RunStatus::Cancelled)
+                    && self.started_at_unix == previous.started_at_unix
             }
             RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => false,
         }
@@ -146,6 +203,35 @@ impl RunRecord {
         self.status = RunStatus::Running;
         self.started_at_unix = Some(started_at_unix);
         self.touch_at(started_at_unix);
+        Ok(())
+    }
+
+    pub fn interrupt(&mut self, interrupted_at_unix: u64) -> Result<(), String> {
+        if !matches!(self.status, RunStatus::Pending | RunStatus::Running) {
+            return Err(format!(
+                "run {} cannot interrupt from {:?}",
+                self.id, self.status
+            ));
+        }
+
+        if interrupted_at_unix < self.created_at_unix {
+            return Err(format!(
+                "run {} cannot interrupt before created_at_unix",
+                self.id
+            ));
+        }
+
+        if let Some(started_at_unix) = self.started_at_unix {
+            if interrupted_at_unix < started_at_unix {
+                return Err(format!(
+                    "run {} cannot interrupt before started_at_unix",
+                    self.id
+                ));
+            }
+        }
+
+        self.status = RunStatus::Interrupted;
+        self.touch_at(interrupted_at_unix);
         Ok(())
     }
 
@@ -248,6 +334,14 @@ impl RunRecord {
                 if self.finished_at_unix.is_some() {
                     return Err(format!(
                         "running run {} must not have finished_at_unix",
+                        self.id
+                    ));
+                }
+            }
+            RunStatus::Interrupted => {
+                if self.finished_at_unix.is_some() {
+                    return Err(format!(
+                        "interrupted run {} must not have finished_at_unix",
                         self.id
                     ));
                 }
@@ -371,6 +465,14 @@ mod tests {
         let pending = run_fixture("run_1", 10);
         let mut running = pending.clone();
         running.start(11).expect("run should start");
+        let mut interrupted_from_pending = pending.clone();
+        interrupted_from_pending
+            .interrupt(11)
+            .expect("pending run should interrupt");
+        let mut interrupted_from_running = running.clone();
+        interrupted_from_running
+            .interrupt(12)
+            .expect("running run should interrupt");
         let mut completed = running.clone();
         completed.complete(12).expect("run should complete");
         let mut failed_from_pending = pending.clone();
@@ -379,11 +481,51 @@ mod tests {
             .expect("pending run should fail");
 
         assert!(running.is_descendant_of(&pending));
+        assert!(interrupted_from_pending.is_descendant_of(&pending));
+        assert!(interrupted_from_running.is_descendant_of(&running));
         assert!(completed.is_descendant_of(&pending));
         assert!(completed.is_descendant_of(&running));
         assert!(!pending.is_descendant_of(&running));
         assert!(!failed_from_pending.is_descendant_of(&running));
         assert!(!completed.is_descendant_of(&failed_from_pending));
+
+        let mut resolved_failed = interrupted_from_running.clone();
+        resolved_failed
+            .fail(13)
+            .expect("interrupted run should resolve as failed");
+        assert!(resolved_failed.is_descendant_of(&interrupted_from_running));
+        assert!(!completed.is_descendant_of(&interrupted_from_running));
+    }
+
+    #[test]
+    fn run_record_interrupts_without_releasing_ownership() {
+        let mut pending = run_fixture("run_pending", 10);
+        pending.interrupt(12).expect("pending run should interrupt");
+        assert_eq!(pending.status(), RunStatus::Interrupted);
+        assert_eq!(pending.started_at_unix(), None);
+        assert_eq!(pending.finished_at_unix(), None);
+        assert_eq!(pending.updated_at_unix(), 12);
+        assert!(!pending.is_terminal());
+        assert!(pending.start(13).is_err());
+        assert!(pending.complete(13).is_err());
+
+        pending
+            .cancel(14)
+            .expect("interrupted run should resolve as cancelled");
+        assert_eq!(pending.status(), RunStatus::Cancelled);
+        assert_eq!(pending.finished_at_unix(), Some(14));
+        assert!(pending.is_terminal());
+
+        let mut running = run_fixture("run_running", 10);
+        running.start(11).expect("run should start");
+        running.interrupt(12).expect("running run should interrupt");
+        assert_eq!(running.status(), RunStatus::Interrupted);
+        assert_eq!(running.started_at_unix(), Some(11));
+        assert_eq!(running.finished_at_unix(), None);
+        running
+            .fail(13)
+            .expect("interrupted run should resolve as failed");
+        assert_eq!(running.status(), RunStatus::Failed);
     }
 
     #[test]
@@ -436,6 +578,20 @@ mod tests {
         let decoded: RunRecord = serde_json::from_str(&encoded).expect("run should decode");
 
         assert_eq!(decoded, run);
+    }
+
+    #[test]
+    fn interrupted_run_round_trips_as_json() {
+        let mut run = run_fixture("run_interrupted", 10);
+        run.start(11).expect("run should start");
+        run.interrupt(12).expect("run should interrupt");
+
+        let encoded = serde_json::to_string(&run).expect("run should serialize");
+        let decoded: RunRecord = serde_json::from_str(&encoded).expect("run should decode");
+
+        assert_eq!(decoded, run);
+        assert_eq!(decoded.status(), RunStatus::Interrupted);
+        assert!(!decoded.is_terminal());
     }
 
     #[test]
@@ -492,6 +648,22 @@ mod tests {
         .expect_err("running run without start timestamp should fail");
 
         assert!(err.to_string().contains("must have started_at_unix"));
+
+        let err = serde_json::from_str::<RunRecord>(&format!(
+            r#"{{
+                "id": "run_interrupted",
+                "session_id": "{}",
+                "status": "interrupted",
+                "created_at_unix": 10,
+                "updated_at_unix": 12,
+                "started_at_unix": 11,
+                "finished_at_unix": 12
+            }}"#,
+            session_id()
+        ))
+        .expect_err("interrupted run must remain unresolved");
+
+        assert!(err.to_string().contains("must not have finished_at_unix"));
     }
 
     fn run_fixture(id: &str, created_at_unix: u64) -> RunRecord {

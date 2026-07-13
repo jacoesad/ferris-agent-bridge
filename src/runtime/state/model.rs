@@ -15,7 +15,7 @@ use crate::runtime::{
         MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
         RunInputRecord,
     },
-    run::{RunId, RunRecord},
+    run::{RunId, RunRecord, RunStartupRecoveryReport, RunStatus},
     session::{Session, SessionId},
 };
 
@@ -295,6 +295,67 @@ impl RuntimeState {
 
         self.touch_at(started_at_unix.max(unix_seconds_now()));
         Ok(())
+    }
+
+    pub fn interrupt_run(&mut self, id: &RunId, interrupted_at_unix: u64) -> Result<(), String> {
+        {
+            let run = self.run_mut(id)?;
+            run.interrupt(interrupted_at_unix)?;
+        }
+
+        self.touch_at(interrupted_at_unix.max(unix_seconds_now()));
+        Ok(())
+    }
+
+    pub(super) fn reconcile_runs_at_startup(
+        &mut self,
+        recovered_at_unix: u64,
+    ) -> Result<(RunStartupRecoveryReport, bool), String> {
+        let run_input_ids = self
+            .run_inputs
+            .iter()
+            .map(|input| input.run_id().clone())
+            .collect::<BTreeSet<_>>();
+        let mut resumable_pending_run_ids = Vec::new();
+        let mut interrupted_run_ids = Vec::new();
+        let mut failed_run_ids = Vec::new();
+        let mut changed = false;
+        let mut latest_interrupted_at = None;
+
+        for run in &mut self.runs {
+            match run.status() {
+                RunStatus::Pending if run_input_ids.contains(run.id()) => {
+                    resumable_pending_run_ids.push(run.id().clone());
+                }
+                RunStatus::Pending | RunStatus::Running => {
+                    let interrupted_at_unix = recovered_at_unix.max(run.updated_at_unix());
+                    run.interrupt(interrupted_at_unix)?;
+                    interrupted_run_ids.push(run.id().clone());
+                    latest_interrupted_at = Some(
+                        latest_interrupted_at
+                            .unwrap_or(interrupted_at_unix)
+                            .max(interrupted_at_unix),
+                    );
+                    changed = true;
+                }
+                RunStatus::Interrupted => interrupted_run_ids.push(run.id().clone()),
+                RunStatus::Failed => failed_run_ids.push(run.id().clone()),
+                RunStatus::Completed | RunStatus::Cancelled => {}
+            }
+        }
+
+        if let Some(interrupted_at_unix) = latest_interrupted_at {
+            self.touch_at(interrupted_at_unix);
+        }
+
+        Ok((
+            RunStartupRecoveryReport::new(
+                resumable_pending_run_ids,
+                interrupted_run_ids,
+                failed_run_ids,
+            ),
+            changed,
+        ))
     }
 
     pub fn complete_run(&mut self, id: &RunId, finished_at_unix: u64) -> Result<(), String> {
@@ -1470,10 +1531,18 @@ mod tests {
         assert!(err.contains(first_id.as_str()));
 
         state
-            .fail_run(&first_id, 12)
+            .interrupt_run(&first_id, 12)
+            .expect("interrupted run should remain active");
+        let err = state
+            .add_run(RunRecord::new(second_id.clone(), session_id.clone(), 13))
+            .expect_err("interrupted ownership must continue blocking the session");
+        assert!(err.contains("already has active run"));
+
+        state
+            .fail_run(&first_id, 14)
             .expect("terminal run should release the session");
         state
-            .add_run(RunRecord::new(second_id, session_id, 13))
+            .add_run(RunRecord::new(second_id, session_id, 15))
             .expect("terminal history must not block a new active run");
     }
     #[test]
