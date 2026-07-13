@@ -1,21 +1,25 @@
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
-    event::InboundEventRecord, outbox::OutboundDeliveryRecord, queue::QueuedMessage,
-    run::RunRecord, session::Session,
+    event::InboundEventRecord,
+    outbox::OutboundDeliveryRecord,
+    queue::{QueuedMessage, RunInputRecord},
+    run::RunRecord,
+    session::Session,
 };
 
 use super::{
-    super::model::RuntimeState,
+    super::model::{PersistedStateParts, RuntimeState},
     versioned,
     wire::{WireField, deserialize_wire_field},
 };
 
-pub const RUNTIME_STATE_FILE_VERSION: u32 = 5;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 6;
 pub(super) const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
 pub(super) const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
 pub(super) const RUNTIME_STATE_FILE_V3_VERSION: u32 = 3;
 pub(super) const RUNTIME_STATE_FILE_V4_VERSION: u32 = 4;
+pub(super) const RUNTIME_STATE_FILE_V5_VERSION: u32 = 5;
 
 pub(in crate::runtime::state) fn state_file_from_state(
     state: &RuntimeState,
@@ -37,6 +41,7 @@ struct RuntimeStateFile<'a> {
     version: u32,
     sessions: &'a [Session],
     runs: &'a [RunRecord],
+    run_inputs: &'a [RunInputRecord],
     inbound_events: &'a [InboundEventRecord],
     queued_messages: &'a [QueuedMessage],
     outbound_deliveries: &'a [OutboundDeliveryRecord],
@@ -49,6 +54,7 @@ impl<'a> RuntimeStateFile<'a> {
             version: RUNTIME_STATE_FILE_VERSION,
             sessions: state.sessions(),
             runs: state.runs(),
+            run_inputs: state.run_inputs(),
             inbound_events: state.inbound_events(),
             queued_messages: state.queued_messages(),
             outbound_deliveries: state.outbound_deliveries(),
@@ -65,6 +71,8 @@ struct RuntimeStateFileWire {
     #[serde(default, deserialize_with = "deserialize_wire_field")]
     runs: WireField<Vec<RunRecord>>,
     #[serde(default, deserialize_with = "deserialize_wire_field")]
+    run_inputs: WireField<Vec<RunInputRecord>>,
+    #[serde(default, deserialize_with = "deserialize_wire_field")]
     inbound_events: WireField<Vec<InboundEventRecord>>,
     #[serde(default, deserialize_with = "deserialize_wire_field")]
     queued_messages: WireField<Vec<QueuedMessage>>,
@@ -78,19 +86,21 @@ impl RuntimeStateFileWire {
         let collections = versioned::decode_persisted_collections(
             self.version,
             self.runs,
+            self.run_inputs,
             self.inbound_events,
             self.queued_messages,
             self.outbound_deliveries,
         )?;
-        RuntimeState::from_persisted_parts(
-            self.sessions,
-            collections.runs,
-            collections.inbound_events,
-            collections.queued_messages,
-            collections.outbound_deliveries,
-            self.updated_at_unix,
-            collections.normalize_aggregate_updated_at,
-        )
+        RuntimeState::from_persisted_parts(PersistedStateParts {
+            sessions: self.sessions,
+            runs: collections.runs,
+            run_inputs: collections.run_inputs,
+            inbound_events: collections.inbound_events,
+            queued_messages: collections.queued_messages,
+            outbound_deliveries: collections.outbound_deliveries,
+            updated_at_unix: self.updated_at_unix,
+            normalize_aggregate_updated_at: collections.normalize_aggregate_updated_at,
+        })
     }
 }
 
@@ -105,6 +115,7 @@ mod tests {
         event::{Event, EventId, EventKind, EventSource, InboundEventRecord},
         message::{Message, MessageAuthor, MessageContent, MessageId},
         outbox::{OutboundDeliveryId, OutboundDeliveryRecord},
+        queue::MessageQueuePolicy,
         run::{RunId, RunRecord},
         session::{Session, SessionId, SessionScope},
         state::{RuntimeState, StateStore},
@@ -144,6 +155,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -176,6 +188,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [{run}],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -204,6 +217,7 @@ mod tests {
             "version": {version},
             "sessions": [],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [{record}],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -232,6 +246,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [{delivery}],
@@ -260,6 +275,7 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": [],
                 "queued_messages": [],
                 "outbound_deliveries": [],
@@ -294,6 +310,7 @@ mod tests {
                 "future_field": true
             }}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -330,6 +347,7 @@ mod tests {
                 "updated_at_unix": 1
             }}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -368,6 +386,7 @@ mod tests {
                 "finished_at_unix": null,
                 "future_field": true
             }}],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -394,6 +413,7 @@ mod tests {
             "version": {},
             "sessions": [],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [{{
                 "id": "evt_1",
                 "received_at_unix": 10,
@@ -429,6 +449,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [{delivery}],
@@ -462,6 +483,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [{delivery}],
@@ -495,6 +517,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [{delivery}],
@@ -524,6 +547,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}, {session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -554,6 +578,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [{run}, {run}],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -584,6 +609,7 @@ mod tests {
             "version": {version},
             "sessions": [],
             "runs": [{run}],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -612,6 +638,7 @@ mod tests {
             "version": {version},
             "sessions": [],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [{record}, {record}],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -740,6 +767,139 @@ mod tests {
         assert!(err.contains("is out of inbound ledger order"));
     }
     #[test]
+    fn state_load_rejects_unknown_run_input_fields() {
+        let (path, mut encoded) = claimed_state_fixture("run-input-unknown-fields");
+        encoded["run_inputs"][0]["future_field"] = serde_json::json!(true);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("unknown run input fields must not be dropped");
+
+        assert!(err.contains("unknown field `future_field`"));
+    }
+    #[test]
+    fn state_validation_rejects_run_input_without_run() {
+        let (path, mut encoded) = claimed_state_fixture("run-input-without-run");
+        encoded["run_inputs"][0]["run_id"] = serde_json::json!("run_missing");
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("run input must reference a durable run");
+
+        assert!(err.contains("references unknown run"));
+    }
+    #[test]
+    fn state_validation_rejects_claimed_message_still_in_queue() {
+        let (path, mut encoded) = claimed_state_fixture("run-input-still-queued");
+        encoded["queued_messages"] =
+            serde_json::json!([encoded["run_inputs"][0]["messages"][0].clone()]);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("claimed messages must leave the queue");
+
+        assert!(err.contains("is still present in the message queue"));
+    }
+    #[test]
+    fn state_validation_rejects_run_input_without_inbound_record() {
+        let (path, mut encoded) = claimed_state_fixture("run-input-without-ledger");
+        encoded["inbound_events"] = serde_json::json!([]);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("claimed messages must retain inbound ledger records");
+
+        assert!(err.contains("has no inbound event record"));
+    }
+    #[test]
+    fn state_validation_rejects_run_input_claim_time_mismatched_with_run() {
+        let (path, mut encoded) = claimed_state_fixture("run-input-claim-time-mismatch");
+        let claimed_at = encoded["run_inputs"][0]["claimed_at_unix"]
+            .as_u64()
+            .expect("claim time should be an integer");
+        encoded["run_inputs"][0]["claimed_at_unix"] = serde_json::json!(claimed_at + 1);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("run and input claim times must agree");
+
+        assert!(err.contains("does not match run created_at_unix"));
+    }
+    #[test]
+    fn state_validation_rejects_claim_that_skips_the_session_queue_prefix() {
+        let (path, mut encoded) = partially_claimed_state_fixture("run-input-skipped-prefix");
+        let claimed_message = encoded["run_inputs"][0]["messages"][0].clone();
+        let queued_message = encoded["queued_messages"][0].clone();
+        let later_enqueued_at = queued_message["enqueued_at_unix"]
+            .as_u64()
+            .expect("enqueue time should be an integer");
+        let claimed_at = encoded["run_inputs"][0]["claimed_at_unix"]
+            .as_u64()
+            .expect("claim time should be an integer")
+            .max(later_enqueued_at);
+        encoded["run_inputs"][0]["messages"][0] = queued_message;
+        encoded["run_inputs"][0]["ready_at_unix"] = serde_json::json!(later_enqueued_at);
+        encoded["run_inputs"][0]["claimed_at_unix"] = serde_json::json!(claimed_at);
+        encoded["runs"][0]["created_at_unix"] = serde_json::json!(claimed_at);
+        encoded["runs"][0]["updated_at_unix"] = serde_json::json!(claimed_at);
+        encoded["queued_messages"][0] = claimed_message;
+        let updated_at = encoded["updated_at_unix"]
+            .as_u64()
+            .expect("state update time should be an integer")
+            .max(claimed_at);
+        encoded["updated_at_unix"] = serde_json::json!(updated_at);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("claimed work must be a prefix of its session queue");
+
+        assert!(err.contains("is before already claimed work"));
+    }
+    #[test]
+    fn state_validation_rejects_queue_time_before_claimed_tail() {
+        let (path, mut encoded) =
+            partially_claimed_state_fixture("run-input-queue-time-regression");
+        let queued_enqueued_at = encoded["queued_messages"][0]["enqueued_at_unix"]
+            .as_u64()
+            .expect("queued enqueue time should be an integer");
+        let claimed_tail = queued_enqueued_at + 1;
+        encoded["run_inputs"][0]["messages"][0]["enqueued_at_unix"] =
+            serde_json::json!(claimed_tail);
+        encoded["run_inputs"][0]["ready_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["run_inputs"][0]["claimed_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["runs"][0]["created_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["runs"][0]["updated_at_unix"] = serde_json::json!(claimed_tail);
+        encoded["updated_at_unix"] = serde_json::json!(claimed_tail);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("queued work must not predate its claimed ownership prefix");
+
+        assert!(err.contains("before already claimed enqueue time"));
+    }
+    #[test]
+    fn state_validation_rejects_reordered_run_input_batches_for_a_session() {
+        let (path, mut encoded) = two_claimed_inputs_fixture("run-input-batch-order");
+        encoded["run_inputs"]
+            .as_array_mut()
+            .expect("run inputs should be an array")
+            .swap(0, 1);
+        write_state_fixture(&path, &encoded);
+
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("run input history must retain session claim order");
+
+        assert!(err.contains("out of session ownership order"));
+    }
+    #[test]
     fn state_validation_rejects_duplicate_outbound_delivery_ids() {
         let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
         let session = session_fixture(&scope, 1, 1);
@@ -750,6 +910,7 @@ mod tests {
             "version": {version},
             "sessions": [{session}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [{delivery}, {delivery}],
@@ -779,6 +940,7 @@ mod tests {
             "version": {version},
             "sessions": [],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [{delivery}],
@@ -811,6 +973,7 @@ mod tests {
                 "updated_at_unix": 1
             }}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -843,6 +1006,7 @@ mod tests {
                 "updated_at_unix": 1
             }}],
             "runs": [],
+            "run_inputs": [],
             "inbound_events": [],
             "queued_messages": [],
             "outbound_deliveries": [],
@@ -932,6 +1096,74 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).expect("persisted state fixture should read"))
                 .expect("persisted state fixture should decode");
         (path, encoded)
+    }
+    fn claimed_state_fixture(name: &str) -> (std::path::PathBuf, serde_json::Value) {
+        let (path, encoded) = queued_state_fixture(name, 1);
+        let store = StateStore::new(&path);
+        let queued_at = encoded["queued_messages"][0]["enqueued_at_unix"]
+            .as_u64()
+            .expect("enqueue time should be an integer");
+        store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect("message batch should claim");
+        let encoded =
+            serde_json::from_slice(&fs::read(&path).expect("claimed state fixture should read"))
+                .expect("claimed state fixture should decode");
+        (path, encoded)
+    }
+    fn partially_claimed_state_fixture(name: &str) -> (std::path::PathBuf, serde_json::Value) {
+        let (path, encoded) = queued_state_fixture(name, 2);
+        let store = StateStore::new(&path);
+        let queued_at = encoded["queued_messages"][0]["enqueued_at_unix"]
+            .as_u64()
+            .expect("enqueue time should be an integer");
+        store
+            .claim_message_batch(
+                RunId::new("run_1").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at,
+            )
+            .expect("first message should claim");
+        let encoded =
+            serde_json::from_slice(&fs::read(&path).expect("partial claim fixture should read"))
+                .expect("partial claim fixture should decode");
+        (path, encoded)
+    }
+    fn two_claimed_inputs_fixture(name: &str) -> (std::path::PathBuf, serde_json::Value) {
+        let (path, first_claim) = partially_claimed_state_fixture(name);
+        let store = StateStore::new(&path);
+        let first_run_id = RunId::new("run_1").expect("valid run id");
+        let first_claimed_at = first_claim["run_inputs"][0]["claimed_at_unix"]
+            .as_u64()
+            .expect("claim time should be an integer");
+        let mut state = store.load().expect("first claim should load");
+        state
+            .fail_run(&first_run_id, first_claimed_at)
+            .expect("first run should become terminal");
+        store.save(&state).expect("terminal run should persist");
+        let queued_at = state.queued_messages()[0].enqueued_at_unix();
+        store
+            .claim_message_batch(
+                RunId::new("run_2").expect("valid run id"),
+                &MessageQueuePolicy::new(0, 1).expect("valid policy"),
+                queued_at.max(first_claimed_at),
+            )
+            .expect("second message should claim");
+        let encoded =
+            serde_json::from_slice(&fs::read(&path).expect("two-claim fixture should read"))
+                .expect("two-claim fixture should decode");
+        (path, encoded)
+    }
+    fn write_state_fixture(path: &std::path::Path, encoded: &serde_json::Value) {
+        fs::write(
+            path,
+            serde_json::to_vec(encoded).expect("state should encode"),
+        )
+        .expect("state fixture should write");
     }
     fn state_event_record(
         event: &Event,

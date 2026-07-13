@@ -110,6 +110,24 @@ impl RunRecord {
         self.status.is_terminal()
     }
 
+    pub(crate) fn is_descendant_of(&self, previous: &Self) -> bool {
+        if self.id != previous.id
+            || self.session_id != previous.session_id
+            || self.created_at_unix != previous.created_at_unix
+            || self.updated_at_unix < previous.updated_at_unix
+        {
+            return false;
+        }
+
+        match previous.status {
+            RunStatus::Pending => self.status != RunStatus::Pending,
+            RunStatus::Running => {
+                self.status.is_terminal() && self.started_at_unix == previous.started_at_unix
+            }
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => false,
+        }
+    }
+
     pub fn start(&mut self, started_at_unix: u64) -> Result<(), String> {
         if self.status != RunStatus::Pending {
             return Err(format!(
@@ -346,6 +364,26 @@ mod tests {
         assert_eq!(run.finished_at_unix(), Some(15));
         assert_eq!(run.updated_at_unix(), 15);
         assert!(run.is_terminal());
+    }
+
+    #[test]
+    fn run_record_recognizes_only_compatible_durable_descendants() {
+        let pending = run_fixture("run_1", 10);
+        let mut running = pending.clone();
+        running.start(11).expect("run should start");
+        let mut completed = running.clone();
+        completed.complete(12).expect("run should complete");
+        let mut failed_from_pending = pending.clone();
+        failed_from_pending
+            .fail(11)
+            .expect("pending run should fail");
+
+        assert!(running.is_descendant_of(&pending));
+        assert!(completed.is_descendant_of(&pending));
+        assert!(completed.is_descendant_of(&running));
+        assert!(!pending.is_descendant_of(&running));
+        assert!(!failed_from_pending.is_descendant_of(&running));
+        assert!(!completed.is_descendant_of(&failed_from_pending));
     }
 
     #[test]

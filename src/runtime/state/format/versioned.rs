@@ -1,17 +1,22 @@
 use crate::runtime::{
-    event::InboundEventRecord, outbox::OutboundDeliveryRecord, queue::QueuedMessage, run::RunRecord,
+    event::InboundEventRecord,
+    outbox::OutboundDeliveryRecord,
+    queue::{QueuedMessage, RunInputRecord},
+    run::RunRecord,
 };
 
 use super::{
     current::{
         RUNTIME_STATE_FILE_V1_VERSION, RUNTIME_STATE_FILE_V2_VERSION,
-        RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_V4_VERSION, RUNTIME_STATE_FILE_VERSION,
+        RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_V4_VERSION,
+        RUNTIME_STATE_FILE_V5_VERSION, RUNTIME_STATE_FILE_VERSION,
     },
     wire::WireField,
 };
 
 pub(super) struct PersistedCollections {
     pub(super) runs: Vec<RunRecord>,
+    pub(super) run_inputs: Vec<RunInputRecord>,
     pub(super) inbound_events: Vec<InboundEventRecord>,
     pub(super) queued_messages: Vec<QueuedMessage>,
     pub(super) outbound_deliveries: Vec<OutboundDeliveryRecord>,
@@ -21,12 +26,14 @@ pub(super) struct PersistedCollections {
 pub(super) fn decode_persisted_collections(
     version: u32,
     runs: WireField<Vec<RunRecord>>,
+    run_inputs: WireField<Vec<RunInputRecord>>,
     inbound_events: WireField<Vec<InboundEventRecord>>,
     queued_messages: WireField<Vec<QueuedMessage>>,
     outbound_deliveries: WireField<Vec<OutboundDeliveryRecord>>,
 ) -> Result<PersistedCollections, String> {
     let (
         runs,
+        run_inputs,
         inbound_events,
         queued_messages,
         outbound_deliveries,
@@ -53,7 +60,18 @@ pub(super) fn decode_persisted_collections(
                 return Err("runtime state version 1 must not contain queued messages".to_string());
             }
 
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), true)
+            if run_inputs.is_present() {
+                return Err("runtime state version 1 must not contain run inputs".to_string());
+            }
+
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                true,
+            )
         }
         RUNTIME_STATE_FILE_V2_VERSION => {
             let runs = runs.into_required("runtime state version 2 must contain run records")?;
@@ -74,7 +92,11 @@ pub(super) fn decode_persisted_collections(
                 return Err("runtime state version 2 must not contain queued messages".to_string());
             }
 
-            (runs, Vec::new(), Vec::new(), Vec::new(), true)
+            if run_inputs.is_present() {
+                return Err("runtime state version 2 must not contain run inputs".to_string());
+            }
+
+            (runs, Vec::new(), Vec::new(), Vec::new(), Vec::new(), true)
         }
         RUNTIME_STATE_FILE_V3_VERSION => {
             let runs = runs.into_required("runtime state version 3 must contain run records")?;
@@ -91,7 +113,18 @@ pub(super) fn decode_persisted_collections(
                 return Err("runtime state version 3 must not contain queued messages".to_string());
             }
 
-            (runs, inbound_events, Vec::new(), Vec::new(), false)
+            if run_inputs.is_present() {
+                return Err("runtime state version 3 must not contain run inputs".to_string());
+            }
+
+            (
+                runs,
+                Vec::new(),
+                inbound_events,
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
         }
         RUNTIME_STATE_FILE_V4_VERSION => {
             let runs = runs.into_required("runtime state version 4 must contain run records")?;
@@ -104,7 +137,40 @@ pub(super) fn decode_persisted_collections(
                 return Err("runtime state version 4 must not contain queued messages".to_string());
             }
 
-            (runs, inbound_events, Vec::new(), outbound_deliveries, false)
+            if run_inputs.is_present() {
+                return Err("runtime state version 4 must not contain run inputs".to_string());
+            }
+
+            (
+                runs,
+                Vec::new(),
+                inbound_events,
+                Vec::new(),
+                outbound_deliveries,
+                false,
+            )
+        }
+        RUNTIME_STATE_FILE_V5_VERSION => {
+            let runs = runs.into_required("runtime state version 5 must contain run records")?;
+            let inbound_events = inbound_events
+                .into_required("runtime state version 5 must contain inbound event records")?;
+            let queued_messages = queued_messages
+                .into_required("runtime state version 5 must contain queued messages")?;
+            let outbound_deliveries = outbound_deliveries
+                .into_required("runtime state version 5 must contain outbound deliveries")?;
+
+            if run_inputs.is_present() {
+                return Err("runtime state version 5 must not contain run inputs".to_string());
+            }
+
+            (
+                runs,
+                Vec::new(),
+                inbound_events,
+                queued_messages,
+                outbound_deliveries,
+                false,
+            )
         }
         RUNTIME_STATE_FILE_VERSION => {
             let runs = runs.into_required(format!(
@@ -119,9 +185,13 @@ pub(super) fn decode_persisted_collections(
             let queued_messages = queued_messages.into_required(format!(
                 "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain queued messages"
             ))?;
+            let run_inputs = run_inputs.into_required(format!(
+                "runtime state version {RUNTIME_STATE_FILE_VERSION} must contain run inputs"
+            ))?;
 
             (
                 runs,
+                run_inputs,
                 inbound_events,
                 queued_messages,
                 outbound_deliveries,
@@ -138,6 +208,7 @@ pub(super) fn decode_persisted_collections(
 
     Ok(PersistedCollections {
         runs,
+        run_inputs,
         inbound_events,
         queued_messages,
         outbound_deliveries,
@@ -461,12 +532,57 @@ mod tests {
         assert!(err.contains("version 4 must not contain queued messages"));
     }
     #[test]
+    fn state_load_migrates_version_5_without_run_inputs() {
+        let path = test_path("state-v5-without-run-inputs").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 5,
+            "sessions": [],
+            "runs": [],
+            "inbound_events": [],
+            "queued_messages": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let state = StateStore::new(path)
+            .load()
+            .expect("version 5 state should migrate with empty run inputs");
+
+        assert!(state.run_inputs().is_empty());
+    }
+    #[test]
+    fn state_load_rejects_version_5_with_run_inputs() {
+        let path = test_path("state-v5-with-run-inputs").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 5,
+            "sessions": [],
+            "runs": [],
+            "run_inputs": [],
+            "inbound_events": [],
+            "queued_messages": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("version 5 must reject present run inputs");
+
+        assert!(err.contains("version 5 must not contain run inputs"));
+    }
+    #[test]
     fn state_load_rejects_future_file_version() {
         let path = test_path("state-future-version").join("runtime.state.json");
         fs::write(
             &path,
             r#"{
-            "version": 6,
+            "version": 7,
             "sessions": [],
             "runs": [],
             "inbound_events": [],
@@ -481,7 +597,7 @@ mod tests {
             .load()
             .expect_err("future state versions must not be loaded");
 
-        assert!(err.contains("unsupported runtime state version 6; expected 5"));
+        assert!(err.contains("unsupported runtime state version 7; expected 6"));
     }
     #[test]
     fn state_load_rejects_current_version_without_run_records() {
@@ -516,6 +632,7 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "updated_at_unix": 1
             }}"#,
                 super::RUNTIME_STATE_FILE_VERSION
@@ -540,6 +657,7 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": null,
                 "updated_at_unix": 1
             }}"#,
@@ -565,6 +683,7 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": [],
                 "outbound_deliveries": [],
                 "updated_at_unix": 1
@@ -591,6 +710,7 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": [],
                 "queued_messages": null,
                 "outbound_deliveries": [],
@@ -618,7 +738,9 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": [],
+                "queued_messages": [],
                 "updated_at_unix": 1
             }}"#,
                 super::RUNTIME_STATE_FILE_VERSION
@@ -643,7 +765,9 @@ mod tests {
                 "version": {},
                 "sessions": [],
                 "runs": [],
+                "run_inputs": [],
                 "inbound_events": [],
+                "queued_messages": [],
                 "outbound_deliveries": null,
                 "updated_at_unix": 1
             }}"#,
@@ -658,6 +782,57 @@ mod tests {
             .expect_err("current state version must reject null outbound deliveries");
 
         assert!(err.contains("must contain outbound deliveries"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_without_run_inputs() {
+        let path = test_path("state-current-without-run-inputs").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "inbound_events": [],
+                "queued_messages": [],
+                "outbound_deliveries": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("current state version must carry run inputs");
+
+        assert!(err.contains("must contain run inputs"));
+    }
+    #[test]
+    fn state_load_rejects_current_version_with_null_run_inputs() {
+        let path = test_path("state-current-with-null-run-inputs").join("runtime.state.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+                "version": {},
+                "sessions": [],
+                "runs": [],
+                "run_inputs": null,
+                "inbound_events": [],
+                "queued_messages": [],
+                "outbound_deliveries": [],
+                "updated_at_unix": 1
+            }}"#,
+                super::RUNTIME_STATE_FILE_VERSION
+            ),
+        )
+        .expect("state fixture should write");
+        let err = StateStore::new(path)
+            .load()
+            .expect_err("current state version must reject null run inputs");
+
+        assert!(err.contains("must contain run inputs"));
     }
     fn test_path(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

@@ -63,6 +63,8 @@ Core Runtime
 
 当某个 transport 支持显式 delivery acknowledgement 时，adapter 应先请求 runtime 持久化或去重归一化后的 inbound event，然后再 ack 平台 delivery。Foundation layer 提供 persistence primitive，初始 runtime orchestrator 边界通过 `InboundDelivery` 和 `ImAdapter::acknowledge_inbound_delivery` 把这一步接起来：runtime 先记录新 event 或识别 duplicate，然后才调用 adapter acknowledgement。绑定 session 的 inbound message 会在与 ledger record 相同的 state replacement 中进入 durable per-scope queue，因此 acknowledgement 不会抢在 pending work 前完成。重复投递判断使用归一化后的 `EventId`，所以 IM adapter 在把 event 交给 runtime 前，必须按 platform 和 scope 给 provider delivery identifier 加命名空间。如果持久化失败，本次 delivery 必须保持未 ack，让平台按照自身 transport 语义重试。真实 provider transport 仍属于具体 IM adapter 内部。
 
+Queue consumption 由独立的 durable boundary 拥有。`StateStore::claim_message_batch` 只会选择没有 pending 或 running run 的 scope，并在同一次原子 state replacement 中创建 pending run、持久化其可恢复的输入消息，再精确移除对应的 bounded queue prefix。Runtime 只有在 replacement 成功后才返回 claim，因此同一 owned process 内的并发 worker 不会拿到相同 scope 或 message batch。
+
 Outbound delivery 使用相反方向的 durable boundary。Runtime 先 claim outbox record，再构造包含稳定 delivery id、normalized scope、message 和 attempt number 的 `OutboundDeliveryAttempt`。`ImAdapter::deliver_outbound_message` 接收这个平台无关的 attempt，并且只有在能够确认 provider 未接受请求时才能把 failure 标记为 retryable；不明确的 transport outcome 保持 uncertain，不能自动重试。Provider request types、幂等机制和 transport 细节留在具体 adapter 内部。Runtime 会先记录 adapter outcome，再调度下一次 attempt。
 
 ### Core 与平台模块
