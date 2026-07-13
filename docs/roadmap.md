@@ -100,7 +100,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Single-step outbox worker with bounded retry scheduling/backoff and retry-safe normalized outbound adapter outcomes
 - Durable per-scope message queue, persisted with inbound ledger records before acknowledgement, with debounce and bounded batching
 - Durable scope-level mutual exclusion: atomically claim one bounded message batch into a pending run with recoverable input, while allowing at most one active run per scope
-- Startup recovery for pending, running, and failed runs into explicit states
+- Startup run reconciliation: keep pending runs with durable input resumable without handing them off, move running or input-less pending runs into non-terminal interrupted ownership, and surface failed runs without automatic retry
 - Startup recovery and explicit reconciliation states for outbound deliveries left `delivering`, without blind retries
 - Workspace policy skeleton with testable decisions
 - Access policy skeleton with testable decisions
