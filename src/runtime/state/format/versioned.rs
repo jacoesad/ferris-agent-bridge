@@ -2,14 +2,14 @@ use crate::runtime::{
     event::InboundEventRecord,
     outbox::OutboundDeliveryRecord,
     queue::{QueuedMessage, RunInputRecord},
-    run::RunRecord,
+    run::{RunRecord, RunStatus},
 };
 
 use super::{
     current::{
         RUNTIME_STATE_FILE_V1_VERSION, RUNTIME_STATE_FILE_V2_VERSION,
         RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_V4_VERSION,
-        RUNTIME_STATE_FILE_V5_VERSION, RUNTIME_STATE_FILE_VERSION,
+        RUNTIME_STATE_FILE_V5_VERSION, RUNTIME_STATE_FILE_V6_VERSION, RUNTIME_STATE_FILE_VERSION,
     },
     wire::WireField,
 };
@@ -75,6 +75,7 @@ pub(super) fn decode_persisted_collections(
         }
         RUNTIME_STATE_FILE_V2_VERSION => {
             let runs = runs.into_required("runtime state version 2 must contain run records")?;
+            reject_interrupted_runs(RUNTIME_STATE_FILE_V2_VERSION, &runs)?;
 
             if inbound_events.is_present() {
                 return Err(
@@ -100,6 +101,7 @@ pub(super) fn decode_persisted_collections(
         }
         RUNTIME_STATE_FILE_V3_VERSION => {
             let runs = runs.into_required("runtime state version 3 must contain run records")?;
+            reject_interrupted_runs(RUNTIME_STATE_FILE_V3_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 3 must contain inbound event records")?;
 
@@ -128,6 +130,7 @@ pub(super) fn decode_persisted_collections(
         }
         RUNTIME_STATE_FILE_V4_VERSION => {
             let runs = runs.into_required("runtime state version 4 must contain run records")?;
+            reject_interrupted_runs(RUNTIME_STATE_FILE_V4_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 4 must contain inbound event records")?;
             let outbound_deliveries = outbound_deliveries
@@ -152,6 +155,7 @@ pub(super) fn decode_persisted_collections(
         }
         RUNTIME_STATE_FILE_V5_VERSION => {
             let runs = runs.into_required("runtime state version 5 must contain run records")?;
+            reject_interrupted_runs(RUNTIME_STATE_FILE_V5_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 5 must contain inbound event records")?;
             let queued_messages = queued_messages
@@ -166,6 +170,27 @@ pub(super) fn decode_persisted_collections(
             (
                 runs,
                 Vec::new(),
+                inbound_events,
+                queued_messages,
+                outbound_deliveries,
+                false,
+            )
+        }
+        RUNTIME_STATE_FILE_V6_VERSION => {
+            let runs = runs.into_required("runtime state version 6 must contain run records")?;
+            reject_interrupted_runs(RUNTIME_STATE_FILE_V6_VERSION, &runs)?;
+            let inbound_events = inbound_events
+                .into_required("runtime state version 6 must contain inbound event records")?;
+            let outbound_deliveries = outbound_deliveries
+                .into_required("runtime state version 6 must contain outbound deliveries")?;
+            let queued_messages = queued_messages
+                .into_required("runtime state version 6 must contain queued messages")?;
+            let run_inputs =
+                run_inputs.into_required("runtime state version 6 must contain run inputs")?;
+
+            (
+                runs,
+                run_inputs,
                 inbound_events,
                 queued_messages,
                 outbound_deliveries,
@@ -214,6 +239,19 @@ pub(super) fn decode_persisted_collections(
         outbound_deliveries,
         normalize_aggregate_updated_at,
     })
+}
+
+fn reject_interrupted_runs(version: u32, runs: &[RunRecord]) -> Result<(), String> {
+    if runs
+        .iter()
+        .any(|run| run.status() == RunStatus::Interrupted)
+    {
+        return Err(format!(
+            "runtime state version {version} must not contain interrupted runs"
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,12 +615,80 @@ mod tests {
         assert!(err.contains("version 5 must not contain run inputs"));
     }
     #[test]
+    fn state_load_migrates_version_6_without_interrupted_runs() {
+        let path = test_path("state-v6-without-interrupted-runs").join("runtime.state.json");
+        fs::write(
+            &path,
+            r#"{
+            "version": 6,
+            "sessions": [],
+            "runs": [],
+            "run_inputs": [],
+            "inbound_events": [],
+            "queued_messages": [],
+            "outbound_deliveries": [],
+            "updated_at_unix": 1
+        }"#,
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(&path);
+
+        let state = store
+            .load()
+            .expect("version 6 state should migrate without changing collections");
+        store.save(&state).expect("migrated state should save");
+        let encoded: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("migrated state should remain readable"),
+        )
+        .expect("migrated state should decode");
+
+        assert_eq!(
+            encoded["version"].as_u64(),
+            Some(u64::from(super::RUNTIME_STATE_FILE_VERSION))
+        );
+        assert!(state.runs().is_empty());
+        assert!(state.run_inputs().is_empty());
+    }
+    #[test]
+    fn state_load_rejects_interrupted_run_in_version_6() {
+        let path = test_path("state-v6-with-interrupted-run").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(
+            SessionScope::new("lark", "chat:interrupted").expect("valid session scope"),
+        );
+        let mut run = RunRecord::new(
+            RunId::new("run_1").expect("valid run id"),
+            session.id().clone(),
+            10,
+        );
+        run.interrupt(11).expect("run should interrupt");
+        let mut state = crate::runtime::state::RuntimeState::new();
+        state.upsert_session(session);
+        state.add_run(run).expect("interrupted run should be valid");
+        store.save(&state).expect("current state should save");
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("current state should remain readable"))
+                .expect("current state should decode");
+        encoded["version"] = serde_json::json!(6);
+        fs::write(
+            &path,
+            serde_json::to_vec(&encoded).expect("version 6 fixture should encode"),
+        )
+        .expect("version 6 fixture should write");
+
+        let err = store
+            .load()
+            .expect_err("version 6 must not accept version 7 run statuses");
+
+        assert!(err.contains("version 6 must not contain interrupted runs"));
+    }
+    #[test]
     fn state_load_rejects_future_file_version() {
         let path = test_path("state-future-version").join("runtime.state.json");
         fs::write(
             &path,
             r#"{
-            "version": 7,
+            "version": 8,
             "sessions": [],
             "runs": [],
             "inbound_events": [],
@@ -597,7 +703,7 @@ mod tests {
             .load()
             .expect_err("future state versions must not be loaded");
 
-        assert!(err.contains("unsupported runtime state version 7; expected 6"));
+        assert!(err.contains("unsupported runtime state version 8; expected 7"));
     }
     #[test]
     fn state_load_rejects_current_version_without_run_records() {

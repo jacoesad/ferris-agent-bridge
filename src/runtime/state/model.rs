@@ -297,6 +297,16 @@ impl RuntimeState {
         Ok(())
     }
 
+    pub fn interrupt_run(&mut self, id: &RunId, interrupted_at_unix: u64) -> Result<(), String> {
+        {
+            let run = self.run_mut(id)?;
+            run.interrupt(interrupted_at_unix)?;
+        }
+
+        self.touch_at(interrupted_at_unix.max(unix_seconds_now()));
+        Ok(())
+    }
+
     pub fn complete_run(&mut self, id: &RunId, finished_at_unix: u64) -> Result<(), String> {
         {
             let run = self.run_mut(id)?;
@@ -1470,10 +1480,18 @@ mod tests {
         assert!(err.contains(first_id.as_str()));
 
         state
-            .fail_run(&first_id, 12)
+            .interrupt_run(&first_id, 12)
+            .expect("interrupted run should remain active");
+        let err = state
+            .add_run(RunRecord::new(second_id.clone(), session_id.clone(), 13))
+            .expect_err("interrupted ownership must continue blocking the session");
+        assert!(err.contains("already has active run"));
+
+        state
+            .fail_run(&first_id, 14)
             .expect("terminal run should release the session");
         state
-            .add_run(RunRecord::new(second_id, session_id, 13))
+            .add_run(RunRecord::new(second_id, session_id, 15))
             .expect("terminal history must not block a new active run");
     }
     #[test]
