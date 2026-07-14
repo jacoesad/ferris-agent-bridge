@@ -69,6 +69,8 @@ Run startup reconciliation 是另一个由 store 拥有的边界。`StateStore::
 
 Outbound delivery 使用相反方向的 durable boundary。Runtime 先 claim outbox record，再构造包含稳定 delivery id、normalized scope、message 和 attempt number 的 `OutboundDeliveryAttempt`。`ImAdapter::deliver_outbound_message` 接收这个平台无关的 attempt，并且只有在能够确认 provider 未接受请求时才能把 failure 标记为 retryable；不明确的 transport outcome 保持 uncertain，不能自动重试。Provider request types、幂等机制和 transport 细节留在具体 adapter 内部。Runtime 会先记录 adapter outcome，再调度下一次 attempt。
 
+Outbound startup reconciliation 在同一个 single-daemon 边界下由 store 拥有。`StateStore::reconcile_outbound_deliveries_at_startup` 会把遗留的 `delivering` record 转为 `uncertain`，并报告完整 unresolved id set，不产生另一次 handoff。只有显式“已接受”或“确认未接受”证据才能解决这些 record；exact same-target replay 只用于在 ambiguous write 后确认 durability。同进程 resolution 会被串行化，cross-process writer coordination 仍不属于当前 architecture 阶段。
+
 ### Core 与平台模块
 
 Core runtime 模块应定义平台无关的领域模型和行为：

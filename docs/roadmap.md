@@ -101,7 +101,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Durable per-scope message queue, persisted with inbound ledger records before acknowledgement, with debounce and bounded batching
 - Durable scope-level mutual exclusion: atomically claim one bounded message batch into a pending run with recoverable input, while allowing at most one active run per scope
 - Startup run reconciliation: keep pending runs with durable input resumable without handing them off, move running or input-less pending runs into non-terminal interrupted ownership, and surface failed runs without automatic retry
-- Startup recovery and explicit reconciliation states for outbound deliveries left `delivering`, without blind retries
+- Store-level outbound startup reconciliation: move every leftover `delivering` record to `uncertain`, report the complete unresolved set, and require explicit accepted or confirmed-not-accepted resolution without blind retries
 - Workspace policy skeleton with testable decisions
 - Access policy skeleton with testable decisions
 - Remaining `ImAdapter` capabilities and `AgentAdapter` capability traits
