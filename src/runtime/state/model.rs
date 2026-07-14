@@ -327,6 +327,35 @@ impl RuntimeState {
         ))
     }
 
+    pub(super) fn resolve_outbound_delivery_as_delivered(
+        &mut self,
+        id: &OutboundDeliveryId,
+        resolved_at_unix: u64,
+    ) -> Result<OutboundDeliveryRecord, String> {
+        let updated_delivery = {
+            let delivery = self.outbound_delivery_mut(id)?;
+            delivery.resolve_uncertain_as_delivered(resolved_at_unix)?;
+            delivery.clone()
+        };
+        self.touch_at(updated_delivery.updated_at_unix().max(unix_seconds_now()));
+        Ok(updated_delivery)
+    }
+
+    pub(super) fn resolve_outbound_delivery_as_failed(
+        &mut self,
+        id: &OutboundDeliveryId,
+        resolved_at_unix: u64,
+        reason: impl Into<String>,
+    ) -> Result<OutboundDeliveryRecord, String> {
+        let updated_delivery = {
+            let delivery = self.outbound_delivery_mut(id)?;
+            delivery.resolve_uncertain_as_failed(resolved_at_unix, reason)?;
+            delivery.clone()
+        };
+        self.touch_at(updated_delivery.updated_at_unix().max(unix_seconds_now()));
+        Ok(updated_delivery)
+    }
+
     pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {
         {
             let run = self.run_mut(id)?;
