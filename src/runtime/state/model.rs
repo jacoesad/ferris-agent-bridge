@@ -9,7 +9,7 @@ use crate::runtime::{
     event::{Event, EventId, EventKind, InboundEventRecord, InboundEventRecordStatus},
     outbox::{
         OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
-        OutboundDeliveryStatus,
+        OutboundDeliveryStartupRecoveryReport, OutboundDeliveryStatus, STARTUP_RECOVERY_DIAGNOSTIC,
     },
     queue::{
         MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
@@ -285,6 +285,46 @@ impl RuntimeState {
         };
         self.touch_at(updated_delivery.updated_at_unix().max(unix_seconds_now()));
         Ok(updated_delivery)
+    }
+
+    pub(super) fn reconcile_outbound_deliveries_at_startup(
+        &mut self,
+        recovered_at_unix: u64,
+    ) -> Result<(OutboundDeliveryStartupRecoveryReport, bool), String> {
+        let mut reconciliation_required_delivery_ids = Vec::new();
+        let mut changed = false;
+        let mut latest_recovered_at = None;
+
+        for delivery in &mut self.outbound_deliveries {
+            match delivery.status() {
+                OutboundDeliveryStatus::Delivering => {
+                    let recovered_at_unix = recovered_at_unix.max(delivery.updated_at_unix());
+                    delivery.mark_uncertain(recovered_at_unix, STARTUP_RECOVERY_DIAGNOSTIC)?;
+                    reconciliation_required_delivery_ids.push(delivery.id().clone());
+                    latest_recovered_at = Some(
+                        latest_recovered_at
+                            .unwrap_or(recovered_at_unix)
+                            .max(recovered_at_unix),
+                    );
+                    changed = true;
+                }
+                OutboundDeliveryStatus::Uncertain => {
+                    reconciliation_required_delivery_ids.push(delivery.id().clone());
+                }
+                OutboundDeliveryStatus::Pending
+                | OutboundDeliveryStatus::Delivered
+                | OutboundDeliveryStatus::Failed => {}
+            }
+        }
+
+        if let Some(recovered_at_unix) = latest_recovered_at {
+            self.touch_at(recovered_at_unix);
+        }
+
+        Ok((
+            OutboundDeliveryStartupRecoveryReport::new(reconciliation_required_delivery_ids),
+            changed,
+        ))
     }
 
     pub fn start_run(&mut self, id: &RunId, started_at_unix: u64) -> Result<(), String> {

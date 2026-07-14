@@ -2,9 +2,12 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+mod recovery;
 mod retry;
 mod worker;
 
+pub use recovery::OutboundDeliveryStartupRecoveryReport;
+pub(crate) use recovery::STARTUP_RECOVERY_DIAGNOSTIC;
 pub use retry::OutboundRetryPolicy;
 pub use worker::{OutboxWorker, OutboxWorkerOutcome};
 
