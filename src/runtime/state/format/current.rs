@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn state_validation_rejects_claim_that_skips_the_session_queue_prefix() {
         let (path, mut encoded) = partially_claimed_state_fixture("run-input-skipped-prefix");
-        let claimed_message = encoded["run_inputs"][0]["messages"][0].clone();
+        let mut claimed_message = encoded["run_inputs"][0]["messages"][0].clone();
         let queued_message = encoded["queued_messages"][0].clone();
         let later_enqueued_at = queued_message["enqueued_at_unix"]
             .as_u64()
@@ -848,6 +848,8 @@ mod tests {
         encoded["run_inputs"][0]["claimed_at_unix"] = serde_json::json!(claimed_at);
         encoded["runs"][0]["created_at_unix"] = serde_json::json!(claimed_at);
         encoded["runs"][0]["updated_at_unix"] = serde_json::json!(claimed_at);
+        // Equal enqueue times isolate the ownership-order violation from timestamp ordering.
+        claimed_message["enqueued_at_unix"] = serde_json::json!(later_enqueued_at);
         encoded["queued_messages"][0] = claimed_message;
         let updated_at = encoded["updated_at_unix"]
             .as_u64()
