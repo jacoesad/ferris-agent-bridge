@@ -2,9 +2,12 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+mod recovery;
 mod retry;
 mod worker;
 
+pub use recovery::OutboundDeliveryStartupRecoveryReport;
+pub(crate) use recovery::STARTUP_RECOVERY_DIAGNOSTIC;
 pub use retry::OutboundRetryPolicy;
 pub use worker::{OutboxWorker, OutboxWorkerOutcome};
 
@@ -286,6 +289,50 @@ impl OutboundDeliveryRecord {
         )
     }
 
+    pub fn resolve_uncertain_as_delivered(&mut self, resolved_at_unix: u64) -> Result<(), String> {
+        if self.status != OutboundDeliveryStatus::Uncertain {
+            return Err(format!(
+                "outbound delivery {} cannot resolve as delivered from {:?}",
+                self.id, self.status
+            ));
+        }
+
+        self.validate_resolution_time(resolved_at_unix, "resolve as delivered")?;
+        self.status = OutboundDeliveryStatus::Delivered;
+        self.delivered_at_unix = Some(resolved_at_unix);
+        self.last_error = None;
+        self.touch_at(resolved_at_unix);
+        Ok(())
+    }
+
+    pub fn resolve_uncertain_as_failed(
+        &mut self,
+        resolved_at_unix: u64,
+        error: impl Into<String>,
+    ) -> Result<(), String> {
+        if self.status != OutboundDeliveryStatus::Uncertain {
+            return Err(format!(
+                "outbound delivery {} cannot resolve as failed from {:?}",
+                self.id, self.status
+            ));
+        }
+
+        self.validate_resolution_time(resolved_at_unix, "resolve as failed")?;
+        let error = error.into();
+        if error.trim().is_empty() {
+            return Err(format!(
+                "outbound delivery {} resolution failure is empty",
+                self.id
+            ));
+        }
+
+        self.status = OutboundDeliveryStatus::Failed;
+        self.delivered_at_unix = None;
+        self.last_error = Some(error);
+        self.touch_at(resolved_at_unix);
+        Ok(())
+    }
+
     fn mark_unsuccessful(
         &mut self,
         status: OutboundDeliveryStatus,
@@ -332,6 +379,24 @@ impl OutboundDeliveryRecord {
         self.delivered_at_unix = None;
         self.last_error = Some(error);
         self.touch_at(updated_at_unix);
+        Ok(())
+    }
+
+    fn validate_resolution_time(&self, resolved_at_unix: u64, action: &str) -> Result<(), String> {
+        if resolved_at_unix < self.created_at_unix {
+            return Err(format!(
+                "outbound delivery {} cannot {action} before created_at_unix",
+                self.id
+            ));
+        }
+
+        if resolved_at_unix < self.updated_at_unix {
+            return Err(format!(
+                "outbound delivery {} cannot {action} before updated_at_unix",
+                self.id
+            ));
+        }
+
         Ok(())
     }
 
@@ -557,6 +622,91 @@ mod tests {
         let decoded: OutboundDeliveryRecord =
             serde_json::from_str(&encoded).expect("uncertain delivery should decode");
         assert_eq!(decoded, delivery);
+    }
+
+    #[test]
+    fn outbound_delivery_resolves_uncertain_outcomes_explicitly() {
+        let mut delivered = delivery_fixture("out_delivered", 10);
+        delivered.begin_delivery(11).expect("delivery should start");
+        delivered
+            .mark_uncertain(12, "provider acceptance is unknown")
+            .expect("delivery should become uncertain");
+        delivered
+            .resolve_uncertain_as_delivered(12)
+            .expect("confirmed acceptance should resolve the delivery");
+
+        assert_eq!(delivered.status(), OutboundDeliveryStatus::Delivered);
+        assert_eq!(delivered.delivery_attempts(), 1);
+        assert_eq!(delivered.delivered_at_unix(), Some(12));
+        assert_eq!(delivered.last_error(), None);
+
+        let mut failed = delivery_fixture("out_failed", 20);
+        failed.begin_delivery(21).expect("delivery should start");
+        failed
+            .mark_uncertain(22, "provider acceptance is unknown")
+            .expect("delivery should become uncertain");
+        failed
+            .resolve_uncertain_as_failed(22, "provider confirmed non-acceptance")
+            .expect("confirmed non-acceptance should resolve the delivery");
+
+        assert_eq!(failed.status(), OutboundDeliveryStatus::Failed);
+        assert_eq!(failed.delivery_attempts(), 1);
+        assert_eq!(failed.delivered_at_unix(), None);
+        assert_eq!(
+            failed.last_error(),
+            Some("provider confirmed non-acceptance")
+        );
+    }
+
+    #[test]
+    fn outbound_delivery_rejects_invalid_uncertain_resolutions_without_mutating() {
+        let mut pending = delivery_fixture("out_pending", 10);
+        let pending_before = pending.clone();
+        let err = pending
+            .resolve_uncertain_as_delivered(11)
+            .expect_err("pending delivery cannot be reconciled");
+        assert!(err.contains("from Pending"));
+        assert_eq!(pending, pending_before);
+
+        let err = pending
+            .resolve_uncertain_as_failed(11, "provider confirmed non-acceptance")
+            .expect_err("pending delivery cannot be reconciled as failed");
+        assert!(err.contains("from Pending"));
+        assert_eq!(pending, pending_before);
+
+        let mut uncertain = delivery_fixture("out_uncertain", 10);
+        uncertain.begin_delivery(11).expect("delivery should start");
+        uncertain
+            .mark_uncertain(12, "provider acceptance is unknown")
+            .expect("delivery should become uncertain");
+
+        let before_backwards = uncertain.clone();
+        let err = uncertain
+            .resolve_uncertain_as_delivered(11)
+            .expect_err("resolution timestamp cannot move backwards");
+        assert!(err.contains("before updated_at_unix"));
+        assert_eq!(uncertain, before_backwards);
+
+        let before_failed_backwards = uncertain.clone();
+        let err = uncertain
+            .resolve_uncertain_as_failed(11, "provider confirmed non-acceptance")
+            .expect_err("failed resolution timestamp cannot move backwards");
+        assert!(err.contains("before updated_at_unix"));
+        assert_eq!(uncertain, before_failed_backwards);
+
+        let before_direct_failure = uncertain.clone();
+        let err = uncertain
+            .mark_failed(13, "provider confirmed non-acceptance")
+            .expect_err("ordinary worker failure cannot resolve uncertainty");
+        assert!(err.contains("cannot fail from Uncertain"));
+        assert_eq!(uncertain, before_direct_failure);
+
+        let before_empty_reason = uncertain.clone();
+        let err = uncertain
+            .resolve_uncertain_as_failed(13, "  ")
+            .expect_err("failed resolution requires evidence");
+        assert!(err.contains("resolution failure is empty"));
+        assert_eq!(uncertain, before_empty_reason);
     }
 
     #[test]

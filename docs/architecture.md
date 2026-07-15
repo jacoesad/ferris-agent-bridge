@@ -69,6 +69,8 @@ Run startup reconciliation is another store-owned boundary. `StateStore::reconci
 
 Outbound delivery follows the inverse durable boundary. The runtime claims an outbox record before constructing an `OutboundDeliveryAttempt` with a stable delivery id, normalized scope, message, and attempt number. `ImAdapter::deliver_outbound_message` receives that platform-neutral attempt and must classify failures as retryable only when provider non-acceptance is known; ambiguous transport outcomes remain uncertain and are not automatically retried. Provider request types, idempotency mechanisms, and transport details remain inside the concrete adapter. The runtime records the adapter outcome before scheduling another attempt.
 
+Outbound startup reconciliation is store-owned under the same single-daemon boundary. `StateStore::reconcile_outbound_deliveries_at_startup` moves leftover `delivering` records to `uncertain` and reports the complete unresolved id set without another handoff. Only explicit accepted or confirmed-not-accepted evidence can resolve those records; exact same-target replay is used solely to confirm durability after an ambiguous write. Same-process resolution is serialized, while cross-process writer coordination remains outside this architecture stage.
+
 ### Core and Platform Modules
 
 Core runtime modules should define platform-neutral domain models and behavior:

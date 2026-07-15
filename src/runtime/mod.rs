@@ -21,8 +21,8 @@ pub use message::{Message, MessageAuthor, MessageContent, MessageId};
 pub use orchestrator::{InboundDeliveryOutcome, RuntimeOrchestrator};
 pub use outbox::{
     OutboundDeliveryAttempt, OutboundDeliveryEnqueueStatus, OutboundDeliveryId,
-    OutboundDeliveryRecord, OutboundDeliveryStatus, OutboundRetryPolicy, OutboxWorker,
-    OutboxWorkerOutcome,
+    OutboundDeliveryRecord, OutboundDeliveryStartupRecoveryReport, OutboundDeliveryStatus,
+    OutboundRetryPolicy, OutboxWorker, OutboxWorkerOutcome,
 };
 pub use queue::{
     MessageBatch, MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,

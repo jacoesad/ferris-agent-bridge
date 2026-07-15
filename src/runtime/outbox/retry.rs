@@ -173,6 +173,54 @@ mod tests {
         assert!(policy.is_due(&delivery, u64::MAX));
     }
 
+    #[test]
+    fn retry_policy_accepts_only_explicitly_failed_uncertain_deliveries() {
+        let policy = OutboundRetryPolicy::new(2, 10, 40).expect("valid retry policy");
+        let mut delivery = delivery_fixture(10);
+        delivery
+            .begin_delivery(11)
+            .expect("first attempt should start");
+        delivery
+            .mark_uncertain(12, "provider acceptance is unknown")
+            .expect("delivery should become uncertain");
+        assert_eq!(policy.next_attempt_at_unix(&delivery), None);
+
+        delivery
+            .resolve_uncertain_as_failed(13, "provider confirmed non-acceptance")
+            .expect("confirmed non-acceptance should permit retry policy");
+
+        assert_eq!(delivery.delivery_attempts(), 1);
+        assert_eq!(policy.next_attempt_at_unix(&delivery), Some(23));
+        assert!(!policy.is_due(&delivery, 22));
+        assert!(policy.is_due(&delivery, 23));
+
+        delivery
+            .begin_delivery(23)
+            .expect("second attempt should start");
+        delivery
+            .mark_uncertain(24, "provider acceptance is unknown")
+            .expect("second attempt should become uncertain");
+        delivery
+            .resolve_uncertain_as_failed(24, "provider confirmed non-acceptance")
+            .expect("confirmed non-acceptance should resolve the second attempt");
+        assert_eq!(delivery.delivery_attempts(), 2);
+        assert_eq!(policy.next_attempt_at_unix(&delivery), None);
+        assert!(!policy.is_due(&delivery, u64::MAX));
+
+        let mut delivered = delivery_fixture(30);
+        delivered
+            .begin_delivery(31)
+            .expect("delivery attempt should start");
+        delivered
+            .mark_uncertain(32, "provider acceptance is unknown")
+            .expect("delivery should become uncertain");
+        delivered
+            .resolve_uncertain_as_delivered(32)
+            .expect("confirmed acceptance should resolve the delivery");
+        assert_eq!(policy.next_attempt_at_unix(&delivered), None);
+        assert!(!policy.is_due(&delivered, u64::MAX));
+    }
+
     fn delivery_fixture(created_at_unix: u64) -> OutboundDeliveryRecord {
         let scope = SessionScope::new("lark", "chat:oc_123").expect("valid scope");
         let session_id = SessionId::for_scope(&scope);
