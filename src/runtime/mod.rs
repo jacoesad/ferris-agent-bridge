@@ -25,7 +25,10 @@ pub use outbox::{
     OutboundDeliveryRecord, OutboundDeliveryStartupRecoveryReport, OutboundDeliveryStatus,
     OutboundRetryPolicy, OutboxWorker, OutboxWorkerOutcome,
 };
-pub use policy::{PolicyDecision, WorkspaceDenialReason, WorkspacePolicy, WorkspaceRoot};
+pub use policy::{
+    AccessAction, AccessDenialReason, AccessPolicy, AccessPrincipal, PolicyDecision,
+    WorkspaceDenialReason, WorkspacePolicy, WorkspaceRoot,
+};
 pub use queue::{
     MessageBatch, MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
     RunInputRecord,

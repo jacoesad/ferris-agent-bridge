@@ -1,5 +1,7 @@
+mod access;
 mod workspace;
 
+pub use access::{AccessAction, AccessDenialReason, AccessPolicy, AccessPrincipal};
 pub use workspace::{WorkspaceDenialReason, WorkspacePolicy, WorkspaceRoot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
