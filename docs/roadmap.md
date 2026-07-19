@@ -104,7 +104,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Store-level outbound startup reconciliation: move every leftover `delivering` record to `uncertain`, report the complete unresolved set, and require explicit accepted or confirmed-not-accepted resolution without blind retries
 - Exact-root workspace policy skeleton with typed allow/deny decisions and deny-by-default behavior
 - Principal/scope access policy skeleton with typed allow/deny decisions and an explicit administrator subset
-- Remaining `ImAdapter` capabilities and `AgentAdapter` capability traits
+- Remaining `ImAdapter` capabilities and a synchronous, completion-oriented `AgentAdapter` capability boundary
 - Concrete runtime orchestrator that wires storage, queues, policies, and adapter boundaries
 - Runtime-level tests that prove duplicate handling, queueing, recovery, and policy decisions
 - Pre-release runtime state schema compatibility consolidation that removes unreleased milestone-intermediate schemas before the metadata-only release PR
@@ -116,6 +116,7 @@ Goal: prove the agent side of the bridge with a controlled adapter and a mock en
 - Mock or echo adapter as the first stable adapter target
 - Controlled fixture CLI that exercises the real process boundary
 - Process spawning abstraction for future real CLI adapters
+- Extend the M3 completion-oriented agent boundary with process and streaming mechanics while preserving its identity, workspace, and failure invariants
 - Stdout, stderr, exit-code, timeout, and cancellation handling
 - Internal `AgentEvent` stream shape
 - Deterministic cancellation and timeout behavior

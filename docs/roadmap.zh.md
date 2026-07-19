@@ -104,7 +104,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Store-level outbound startup reconciliation：把所有遗留 `delivering` record 转为 `uncertain`，报告完整 unresolved set，并要求通过显式“已接受”或“确认未接受”resolution 解决，禁止盲目重试
 - Exact-root workspace policy skeleton，提供 typed allow/deny decision，并默认拒绝
 - Principal/scope access policy skeleton，提供 typed allow/deny decision 和显式 administrator subset
-- 剩余 `ImAdapter` 能力和 `AgentAdapter` capability traits
+- 剩余 `ImAdapter` 能力和 synchronous、completion-oriented 的 `AgentAdapter` capability boundary
 - 具体 runtime orchestrator，用于串联 storage、queues、policies 和 adapter boundaries
 - Runtime-level tests，证明 duplicate handling、queueing、recovery 和 policy decisions
 - Release 前的 runtime state schema compatibility consolidation：在只包含 metadata 的 release PR 前移除 milestone 开发期未发布的中间 schema
@@ -116,6 +116,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Mock 或 echo adapter 作为第一个稳定 adapter target
 - 通过 controlled fixture CLI 验证真实 process boundary
 - 面向未来真实 CLI adapters 的 process spawning abstraction
+- 在保持 identity、workspace 和 failure invariants 的前提下，为 M3 completion-oriented agent boundary 增加 process 与 streaming mechanics
 - Stdout、stderr、exit-code、timeout 和 cancellation handling
 - 内部 `AgentEvent` stream shape
 - 确定性的 cancellation 和 timeout behavior
