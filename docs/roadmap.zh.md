@@ -102,8 +102,8 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Durable scope 级互斥：把一个 bounded message batch 原子领取为带可恢复 input 的 pending run，并确保同一个 scope 同时最多一个 active run
 - Startup run reconciliation：保留具有 durable input 的 pending run 为可恢复但不直接 handoff；将 running 或缺少 input 的 pending run 转为继续持有 scope 的 non-terminal interrupted 状态；显式报告 failed run 但不自动 retry
 - Store-level outbound startup reconciliation：把所有遗留 `delivering` record 转为 `uncertain`，报告完整 unresolved set，并要求通过显式“已接受”或“确认未接受”resolution 解决，禁止盲目重试
-- Workspace policy skeleton，并让 decisions 可测试
-- Access policy skeleton，并让 decisions 可测试
+- Exact-root workspace policy skeleton，提供 typed allow/deny decision，并默认拒绝
+- Principal/scope access policy skeleton，提供 typed allow/deny decision 和显式 administrator subset
 - 剩余 `ImAdapter` 能力和 `AgentAdapter` capability traits
 - 具体 runtime orchestrator，用于串联 storage、queues、policies 和 adapter boundaries
 - Runtime-level tests，证明 duplicate handling、queueing、recovery 和 policy decisions

@@ -6,6 +6,7 @@ pub mod message;
 pub mod orchestrator;
 pub mod outbox;
 mod persistence;
+pub mod policy;
 pub mod queue;
 pub mod run;
 pub mod session;
@@ -23,6 +24,10 @@ pub use outbox::{
     OutboundDeliveryAttempt, OutboundDeliveryEnqueueStatus, OutboundDeliveryId,
     OutboundDeliveryRecord, OutboundDeliveryStartupRecoveryReport, OutboundDeliveryStatus,
     OutboundRetryPolicy, OutboxWorker, OutboxWorkerOutcome,
+};
+pub use policy::{
+    AccessAction, AccessDenialReason, AccessPolicy, AccessPrincipal, PolicyDecision,
+    WorkspaceDenialReason, WorkspacePolicy, WorkspaceRoot,
 };
 pub use queue::{
     MessageBatch, MessageBatchClaimOutcome, MessageQueuePolicy, MessageQueuePoll, QueuedMessage,
