@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     ffi::OsString,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
 };
 
 use super::PolicyDecision;
@@ -25,6 +25,20 @@ impl WorkspaceRoot {
                     );
                 }
                 Component::Normal(_) => has_normal_component = true,
+                Component::Prefix(prefix)
+                    if !matches!(
+                        prefix.kind(),
+                        Prefix::Disk(_)
+                            | Prefix::UNC(_, _)
+                            | Prefix::VerbatimDisk(_)
+                            | Prefix::VerbatimUNC(_, _)
+                    ) =>
+                {
+                    return Err(
+                        "workspace root must use a disk or UNC filesystem path namespace"
+                            .to_owned(),
+                    );
+                }
                 _ => {}
             }
         }
@@ -252,6 +266,25 @@ mod tests {
             PathBuf::from(r"\\?\UNC\server\share\."),
         ] {
             assert!(WorkspaceRoot::new(path).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_roots_reject_non_filesystem_windows_namespaces() {
+        for path in [
+            PathBuf::from(r"\\.\COM42\child"),
+            PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\child"),
+        ] {
+            assert!(path.is_absolute());
+            assert!(
+                path.components()
+                    .any(|component| matches!(component, std::path::Component::Normal(_)))
+            );
+            assert_eq!(
+                WorkspaceRoot::new(path).expect_err("non-filesystem namespace must be rejected"),
+                "workspace root must use a disk or UNC filesystem path namespace"
+            );
         }
     }
 
