@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 use crate::runtime::{
     message::{Message, MessageAuthor},
     policy::WorkspaceRoot,
+    queue::RunInputRecord,
     run::RunId,
     session::SessionId,
 };
@@ -16,40 +17,21 @@ pub struct AgentRunRequest {
 }
 
 impl AgentRunRequest {
-    pub fn new(
-        run_id: RunId,
-        session_id: SessionId,
-        messages: Vec<Message>,
-        workspace_root: WorkspaceRoot,
-    ) -> Result<Self, String> {
-        if messages.is_empty() {
-            return Err(format!(
-                "agent run {run_id} request must contain at least one message"
-            ));
-        }
-
-        for message in &messages {
-            if message.author != MessageAuthor::User {
-                return Err(format!(
-                    "agent run {run_id} request message {} must be user-authored",
-                    message.id
-                ));
-            }
-
-            if message.session_id.as_ref() != Some(&session_id) {
-                return Err(format!(
-                    "agent run {run_id} request message {} does not match session {session_id}",
-                    message.id
-                ));
-            }
-        }
-
-        Ok(Self {
-            run_id,
-            session_id,
-            messages,
+    #[allow(
+        dead_code,
+        reason = "reserved for the next M3 concrete orchestrator slice"
+    )]
+    pub(crate) fn from_run_input(input: &RunInputRecord, workspace_root: WorkspaceRoot) -> Self {
+        Self {
+            run_id: input.run_id().clone(),
+            session_id: input.session_id().clone(),
+            messages: input
+                .messages()
+                .iter()
+                .map(|queued| queued.message().clone())
+                .collect(),
             workspace_root,
-        })
+        }
     }
 
     pub fn run_id(&self) -> &RunId {
@@ -198,7 +180,7 @@ mod tests {
         event::{Event, EventId, EventKind, EventSource},
         message::{Message, MessageAuthor, MessageContent, MessageId},
         policy::WorkspaceRoot,
-        queue::{MessageBatchClaimOutcome, MessageQueuePolicy},
+        queue::{MessageBatchClaimOutcome, MessageQueuePolicy, RunInputRecord},
         run::RunId,
         session::{Session, SessionId, SessionScope},
         state::{RuntimeState, StateStore},
@@ -209,9 +191,13 @@ mod tests {
 
     #[test]
     fn request_preserves_durable_identity_message_order_and_workspace() {
-        let request = request_fixture("request-shape");
+        let input = claimed_input_fixture("request-shape");
+        let workspace_root =
+            WorkspaceRoot::new(absolute_path("workspace")).expect("valid workspace root");
+        let request = AgentRunRequest::from_run_input(&input, workspace_root);
 
-        assert_eq!(request.run_id().as_str(), "run_1");
+        assert_eq!(request.run_id(), input.run_id());
+        assert_eq!(request.session_id(), input.session_id());
         assert_eq!(
             request
                 .messages()
@@ -219,6 +205,14 @@ mod tests {
                 .map(|message| message.id.as_str())
                 .collect::<Vec<_>>(),
             ["msg_1", "msg_2"]
+        );
+        assert_eq!(
+            request.messages(),
+            input
+                .messages()
+                .iter()
+                .map(|queued| queued.message().clone())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             request.workspace_root().as_path(),
@@ -230,55 +224,6 @@ mod tests {
                 .iter()
                 .all(|message| message.session_id.as_ref() == Some(request.session_id()))
         );
-    }
-
-    #[test]
-    fn request_rejects_empty_non_user_and_mismatched_session_messages() {
-        let run_id = RunId::new("run_invalid").expect("valid run id");
-        let session_id = SessionId::for_scope(
-            &SessionScope::new("lark", "chat:oc_123").expect("valid session scope"),
-        );
-        let workspace_root =
-            WorkspaceRoot::new(absolute_path("workspace")).expect("valid workspace root");
-
-        assert!(
-            AgentRunRequest::new(
-                run_id.clone(),
-                session_id.clone(),
-                Vec::new(),
-                workspace_root.clone(),
-            )
-            .is_err()
-        );
-
-        let err = AgentRunRequest::new(
-            run_id.clone(),
-            session_id.clone(),
-            vec![agent_message("reply_1", session_id.clone(), "not input")],
-            workspace_root.clone(),
-        )
-        .expect_err("agent-authored input should be rejected");
-        assert!(err.contains("user-authored"));
-
-        let other_session = SessionId::for_scope(
-            &SessionScope::new("lark", "chat:other").expect("valid session scope"),
-        );
-        let err = AgentRunRequest::new(
-            run_id,
-            session_id,
-            vec![
-                Message::user_text(
-                    "msg_other",
-                    Some(other_session),
-                    "wrong session",
-                    FUTURE_UNIX,
-                )
-                .expect("valid user message"),
-            ],
-            workspace_root,
-        )
-        .expect_err("cross-session input should be rejected");
-        assert!(err.contains("does not match session"));
     }
 
     #[test]
@@ -390,6 +335,14 @@ mod tests {
     }
 
     fn request_fixture(name: &str) -> AgentRunRequest {
+        let input = claimed_input_fixture(name);
+        let workspace_root =
+            WorkspaceRoot::new(absolute_path("workspace")).expect("valid workspace root");
+
+        AgentRunRequest::from_run_input(&input, workspace_root)
+    }
+
+    fn claimed_input_fixture(name: &str) -> RunInputRecord {
         let store = StateStore::new(test_path(name).join("runtime.state.json"));
         let session =
             Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid session scope"));
@@ -420,20 +373,8 @@ mod tests {
         else {
             panic!("full message batch should be ready");
         };
-        let workspace_root =
-            WorkspaceRoot::new(absolute_path("workspace")).expect("valid workspace root");
 
-        AgentRunRequest::new(
-            input.run_id().clone(),
-            input.session_id().clone(),
-            input
-                .messages()
-                .iter()
-                .map(|queued| queued.message().clone())
-                .collect(),
-            workspace_root,
-        )
-        .expect("durable run input should create a valid request")
+        input
     }
 
     fn message_event(
