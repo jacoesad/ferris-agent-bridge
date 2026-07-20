@@ -1,5 +1,11 @@
 use std::{error::Error, fmt};
 
+mod agent;
+
+pub use agent::{
+    AgentAdapter, AgentRunFailure, AgentRunFailureKind, AgentRunOutput, AgentRunRequest,
+};
+
 use crate::runtime::{
     event::{Event, EventId, InboundEventRecordStatus},
     outbox::OutboundDeliveryAttempt,
