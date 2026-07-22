@@ -80,10 +80,10 @@ mod tests {
             running_id.clone(),
             FUTURE_UNIX + 20,
         );
-        let mut state = store.load().expect("claimed state should load");
-        state
-            .start_run(&running_id, running_claimed_at + 1)
-            .expect("claimed run should start");
+        store
+            .start_agent_run(&running_id, running_claimed_at + 1)
+            .expect("claimed run should start through the durable transition");
+        let mut state = store.load().expect("running state should load");
 
         let mut failed =
             RunRecord::new(failed_id.clone(), session_ids[2].clone(), FUTURE_UNIX + 30);
@@ -356,11 +356,9 @@ mod tests {
             FUTURE_UNIX + 10,
         );
         let started_at = claimed_at + 1;
-        let mut state = store.load().expect("claimed state should load");
-        state
-            .start_run(&run_id, started_at)
-            .expect("claimed run should start");
-        store.save(&state).expect("running state should persist");
+        store
+            .start_agent_run(&run_id, started_at)
+            .expect("claimed run should start through the durable transition");
         (store, run_id, started_at)
     }
 

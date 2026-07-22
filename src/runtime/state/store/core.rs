@@ -4,7 +4,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use crate::runtime::{outbox::OutboundDeliveryStatus, persistence::write_json_atomic};
+use crate::runtime::{
+    outbox::OutboundDeliveryStatus, persistence::write_json_atomic, run::RunStatus,
+};
 
 use super::{
     super::{
@@ -67,6 +69,7 @@ impl StateStore {
         let existing = self.load_existing_for_merge()?;
         validate_snapshot_outbound_additions(&state, existing.as_ref())?;
         validate_snapshot_run_input_additions(&state, existing.as_ref())?;
+        validate_snapshot_agent_run_transitions(&state, existing.as_ref())?;
         validate_snapshot_run_output_additions(&state, existing.as_ref())?;
 
         if let Some(existing) = existing {
@@ -178,6 +181,40 @@ fn validate_snapshot_run_output_additions(
             return Err(format!(
                 "runtime state save cannot introduce or change output delivery ownership for run {}; agent output must be committed through the StateStore agent-run completion transition",
                 run.id()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_snapshot_agent_run_transitions(
+    candidate: &RuntimeState,
+    existing: Option<&RuntimeState>,
+) -> Result<(), String> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+
+    for candidate_run in candidate.runs() {
+        if existing.run_input(candidate_run.id()).is_none() {
+            continue;
+        }
+
+        let existing_run = existing
+            .run(candidate_run.id())
+            .expect("validated run input must reference an existing run");
+        if candidate_run == existing_run || existing_run.is_descendant_of(candidate_run) {
+            continue;
+        }
+
+        if matches!(
+            candidate_run.status(),
+            RunStatus::Running | RunStatus::Completed
+        ) {
+            return Err(format!(
+                "runtime state save cannot create a handoff or completion for durable agent run {}; use the StateStore agent-run transition",
+                candidate_run.id()
             ));
         }
     }

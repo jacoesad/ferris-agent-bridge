@@ -724,18 +724,23 @@ mod tests {
     #[test]
     fn state_load_migrates_version_7_without_output_delivery_links() {
         let path = test_path("state-v7-without-output-links").join("runtime.state.json");
+        let session =
+            Session::new(SessionScope::new("lark", "chat:v7").expect("valid session scope"));
+        let run_id = RunId::new("run_v7").expect("valid run id");
+        let mut state = crate::runtime::state::RuntimeState::new();
+        state.upsert_session(session.clone());
+        state
+            .add_run(RunRecord::new(run_id.clone(), session.id().clone(), 10))
+            .expect("version 7 pending run should be valid");
+        let mut encoded = serde_json::to_value(&state).expect("version 7 state should encode");
+        encoded["version"] = serde_json::json!(7);
+        encoded["runs"][0]
+            .as_object_mut()
+            .expect("run should be an object")
+            .remove("output_delivery_ids");
         fs::write(
             &path,
-            r#"{
-            "version": 7,
-            "sessions": [],
-            "runs": [],
-            "run_inputs": [],
-            "inbound_events": [],
-            "queued_messages": [],
-            "outbound_deliveries": [],
-            "updated_at_unix": 1
-        }"#,
+            serde_json::to_vec(&encoded).expect("version 7 fixture should encode"),
         )
         .expect("state fixture should write");
         let store = StateStore::new(&path);
@@ -743,6 +748,13 @@ mod tests {
         let state = store
             .load()
             .expect("version 7 state should migrate without output links");
+        assert!(
+            state
+                .run(&run_id)
+                .expect("migrated run should remain present")
+                .output_delivery_ids()
+                .is_empty()
+        );
         store.save(&state).expect("migrated state should save");
         let encoded: serde_json::Value = serde_json::from_slice(
             &fs::read(&path).expect("migrated state should remain readable"),
@@ -753,6 +765,7 @@ mod tests {
             encoded["version"].as_u64(),
             Some(u64::from(super::RUNTIME_STATE_FILE_VERSION))
         );
+        assert!(encoded["runs"][0].get("output_delivery_ids").is_some());
     }
     #[test]
     fn state_load_rejects_output_delivery_links_in_version_7() {

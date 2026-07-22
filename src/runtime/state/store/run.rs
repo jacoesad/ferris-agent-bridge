@@ -356,6 +356,55 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_save_cannot_advance_a_durable_agent_run() {
+        let (store, run_id, _, _) = pending_agent_run("snapshot-lifecycle-bypass");
+        let stale_pending = store.load().expect("pending state should load");
+        let mut starting = store.load().expect("pending state should load");
+        starting
+            .start_run(&run_id, FUTURE_UNIX + 1)
+            .expect("snapshot can represent a running run in memory");
+
+        let err = store
+            .save(&starting)
+            .expect_err("snapshot save must not create an agent handoff");
+        assert!(err.contains("cannot create a handoff or completion"));
+        assert_eq!(
+            store
+                .load()
+                .expect("state should remain readable")
+                .run(&run_id)
+                .expect("run should remain durable")
+                .status(),
+            RunStatus::Pending
+        );
+
+        store
+            .start_agent_run(&run_id, FUTURE_UNIX + 1)
+            .expect("store transition should start the run");
+        store
+            .save(&stale_pending)
+            .expect("stale ancestor should preserve the durable running run");
+        let mut completing = store.load().expect("running state should load");
+        completing
+            .complete_run(&run_id, FUTURE_UNIX + 2)
+            .expect("snapshot can represent outputless completion in memory");
+
+        let err = store
+            .save(&completing)
+            .expect_err("snapshot save must not bypass atomic output completion");
+        assert!(err.contains("cannot create a handoff or completion"));
+        assert_eq!(
+            store
+                .load()
+                .expect("state should remain readable")
+                .run(&run_id)
+                .expect("run should remain durable")
+                .status(),
+            RunStatus::Running
+        );
+    }
+
+    #[test]
     fn start_agent_run_requires_input_and_returns_no_handoff_on_write_failure() {
         let missing_input_store = state_store_with_session("start-missing-input");
         let session_id = only_session_id(&missing_input_store);
@@ -615,33 +664,65 @@ mod tests {
 
     #[test]
     fn completion_replay_accepts_output_after_delivery_status_advances() {
-        let (store, run_id, _, session_id) = running_agent_run("complete-progressed-output");
-        let output = [agent_message(
-            "reply_progressed",
-            &session_id,
-            "delivered",
-            FUTURE_UNIX + 2,
-        )];
-        let completed = store
-            .complete_agent_run(&run_id, &output, FUTURE_UNIX + 3)
-            .expect("first completion should persist");
-        let delivery_id = completed[0].id().clone();
+        for target_status in [
+            OutboundDeliveryStatus::Delivering,
+            OutboundDeliveryStatus::Delivered,
+            OutboundDeliveryStatus::Failed,
+            OutboundDeliveryStatus::Uncertain,
+        ] {
+            let label = format!("complete-progressed-{target_status:?}");
+            let (store, run_id, _, session_id) = running_agent_run(&label);
+            let output = [agent_message(
+                &format!("reply_{target_status:?}"),
+                &session_id,
+                "progressed",
+                FUTURE_UNIX + 2,
+            )];
+            let completed = store
+                .complete_agent_run(&run_id, &output, FUTURE_UNIX + 3)
+                .expect("first completion should persist");
+            let delivery_id = completed[0].id().clone();
 
-        let claimed = store
-            .claim_next_outbound_delivery(FUTURE_UNIX + 4)
-            .expect("pending output should be claimable")
-            .expect("completed run should own one pending output");
-        assert_eq!(claimed.id(), &delivery_id);
-        store
-            .mark_outbound_delivery_delivered(&delivery_id, FUTURE_UNIX + 5)
-            .expect("claimed output should become delivered");
+            let claimed = store
+                .claim_next_outbound_delivery(FUTURE_UNIX + 4)
+                .expect("pending output should be claimable")
+                .expect("completed run should own one pending output");
+            assert_eq!(claimed.id(), &delivery_id);
+            match target_status {
+                OutboundDeliveryStatus::Delivering => {}
+                OutboundDeliveryStatus::Delivered => {
+                    store
+                        .mark_outbound_delivery_delivered(&delivery_id, FUTURE_UNIX + 5)
+                        .expect("claimed output should become delivered");
+                }
+                OutboundDeliveryStatus::Failed => {
+                    store
+                        .mark_outbound_delivery_failed(
+                            &delivery_id,
+                            FUTURE_UNIX + 5,
+                            "retryable failure",
+                        )
+                        .expect("claimed output should become failed");
+                }
+                OutboundDeliveryStatus::Uncertain => {
+                    store
+                        .mark_outbound_delivery_uncertain(
+                            &delivery_id,
+                            FUTURE_UNIX + 5,
+                            "uncertain delivery",
+                        )
+                        .expect("claimed output should become uncertain");
+                }
+                OutboundDeliveryStatus::Pending => unreachable!("target status is progressed"),
+            }
 
-        let replayed = store
-            .complete_agent_run(&run_id, &output, FUTURE_UNIX + 3)
-            .expect("exact completion replay should ignore mutable delivery status");
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].status(), OutboundDeliveryStatus::Delivered);
-        assert_eq!(replayed[0].id(), &delivery_id);
+            let replayed = store
+                .complete_agent_run(&run_id, &output, FUTURE_UNIX + 3)
+                .expect("exact completion replay should ignore mutable delivery status");
+            assert_eq!(replayed.len(), 1);
+            assert_eq!(replayed[0].status(), target_status);
+            assert_eq!(replayed[0].id(), &delivery_id);
+        }
     }
 
     #[test]
