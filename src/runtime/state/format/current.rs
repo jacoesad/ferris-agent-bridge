@@ -14,13 +14,14 @@ use super::{
     wire::{WireField, deserialize_wire_field},
 };
 
-pub const RUNTIME_STATE_FILE_VERSION: u32 = 7;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 8;
 pub(super) const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
 pub(super) const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
 pub(super) const RUNTIME_STATE_FILE_V3_VERSION: u32 = 3;
 pub(super) const RUNTIME_STATE_FILE_V4_VERSION: u32 = 4;
 pub(super) const RUNTIME_STATE_FILE_V5_VERSION: u32 = 5;
 pub(super) const RUNTIME_STATE_FILE_V6_VERSION: u32 = 6;
+pub(super) const RUNTIME_STATE_FILE_V7_VERSION: u32 = 7;
 
 pub(in crate::runtime::state) fn state_file_from_state(
     state: &RuntimeState,

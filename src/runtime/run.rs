@@ -1,8 +1,8 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
-use super::session::SessionId;
+use super::{outbox::OutboundDeliveryId, session::SessionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct RunId(String);
@@ -64,6 +64,7 @@ pub struct RunRecord {
     updated_at_unix: u64,
     started_at_unix: Option<u64>,
     finished_at_unix: Option<u64>,
+    output_delivery_ids: Vec<OutboundDeliveryId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +116,7 @@ impl RunRecord {
             updated_at_unix: created_at_unix,
             started_at_unix: None,
             finished_at_unix: None,
+            output_delivery_ids: Vec::new(),
         }
     }
 
@@ -146,6 +148,10 @@ impl RunRecord {
         self.finished_at_unix
     }
 
+    pub fn output_delivery_ids(&self) -> &[OutboundDeliveryId] {
+        &self.output_delivery_ids
+    }
+
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
     }
@@ -155,6 +161,8 @@ impl RunRecord {
             || self.session_id != previous.session_id
             || self.created_at_unix != previous.created_at_unix
             || self.updated_at_unix < previous.updated_at_unix
+            || (self.status != RunStatus::Completed
+                && self.output_delivery_ids != previous.output_delivery_ids)
         {
             return false;
         }
@@ -236,6 +244,14 @@ impl RunRecord {
     }
 
     pub fn complete(&mut self, finished_at_unix: u64) -> Result<(), String> {
+        self.complete_with_output_deliveries(finished_at_unix, Vec::new())
+    }
+
+    pub(crate) fn complete_with_output_deliveries(
+        &mut self,
+        finished_at_unix: u64,
+        output_delivery_ids: Vec<OutboundDeliveryId>,
+    ) -> Result<(), String> {
         if self.status != RunStatus::Running {
             return Err(format!(
                 "run {} cannot complete from {:?}",
@@ -243,7 +259,19 @@ impl RunRecord {
             ));
         }
 
-        self.finish(RunStatus::Completed, finished_at_unix)
+        let mut unique_ids = BTreeSet::new();
+        for id in &output_delivery_ids {
+            if !unique_ids.insert(id) {
+                return Err(format!(
+                    "run {} contains duplicate output delivery id {id}",
+                    self.id
+                ));
+            }
+        }
+
+        self.finish(RunStatus::Completed, finished_at_unix)?;
+        self.output_delivery_ids = output_delivery_ids;
+        Ok(())
     }
 
     pub fn fail(&mut self, finished_at_unix: u64) -> Result<(), String> {
@@ -269,6 +297,23 @@ impl RunRecord {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        let mut output_delivery_ids = BTreeSet::new();
+        for id in &self.output_delivery_ids {
+            if !output_delivery_ids.insert(id) {
+                return Err(format!(
+                    "run {} contains duplicate output delivery id {id}",
+                    self.id
+                ));
+            }
+        }
+
+        if self.status != RunStatus::Completed && !self.output_delivery_ids.is_empty() {
+            return Err(format!(
+                "{:?} run {} must not reference output deliveries",
+                self.status, self.id
+            ));
+        }
+
         if self.updated_at_unix < self.created_at_unix {
             return Err(format!(
                 "run {} has updated_at_unix before created_at_unix",
@@ -410,6 +455,8 @@ impl<'de> Deserialize<'de> for RunRecord {
             updated_at_unix: u64,
             started_at_unix: Option<u64>,
             finished_at_unix: Option<u64>,
+            #[serde(default)]
+            output_delivery_ids: Vec<OutboundDeliveryId>,
         }
 
         let wire = RunRecordWire::deserialize(deserializer)?;
@@ -421,6 +468,7 @@ impl<'de> Deserialize<'de> for RunRecord {
             updated_at_unix: wire.updated_at_unix,
             started_at_unix: wire.started_at_unix,
             finished_at_unix: wire.finished_at_unix,
+            output_delivery_ids: wire.output_delivery_ids,
         };
 
         record.validate().map_err(de::Error::custom)?;
@@ -438,7 +486,10 @@ fn is_valid_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{RunId, RunRecord, RunStatus};
-    use crate::runtime::session::{SessionId, SessionScope};
+    use crate::runtime::{
+        outbox::OutboundDeliveryId,
+        session::{SessionId, SessionScope},
+    };
 
     #[test]
     fn run_record_transitions_from_pending_to_completed() {
@@ -578,6 +629,31 @@ mod tests {
         let decoded: RunRecord = serde_json::from_str(&encoded).expect("run should decode");
 
         assert_eq!(decoded, run);
+    }
+
+    #[test]
+    fn completed_run_preserves_ordered_unique_output_delivery_ids() {
+        let first = OutboundDeliveryId::new("out_1").expect("valid delivery id");
+        let second = OutboundDeliveryId::new("out_2").expect("valid delivery id");
+        let mut run = run_fixture("run_output", 10);
+        run.start(11).expect("run should start");
+        run.complete_with_output_deliveries(12, vec![first.clone(), second.clone()])
+            .expect("run should complete with output ownership");
+
+        assert_eq!(run.output_delivery_ids(), &[first, second]);
+        let encoded = serde_json::to_string(&run).expect("run should serialize");
+        let decoded: RunRecord = serde_json::from_str(&encoded).expect("run should decode");
+        assert_eq!(decoded, run);
+
+        let duplicate = OutboundDeliveryId::new("out_duplicate").expect("valid delivery id");
+        let mut invalid = run_fixture("run_duplicate_output", 10);
+        invalid.start(11).expect("run should start");
+        assert!(
+            invalid
+                .complete_with_output_deliveries(12, vec![duplicate.clone(), duplicate])
+                .is_err()
+        );
+        assert_eq!(invalid.status(), RunStatus::Running);
     }
 
     #[test]

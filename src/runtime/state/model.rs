@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::runtime::{
     event::{Event, EventId, EventKind, InboundEventRecord, InboundEventRecordStatus},
+    message::MessageAuthor,
     outbox::{
         OutboundDeliveryEnqueueStatus, OutboundDeliveryId, OutboundDeliveryRecord,
         OutboundDeliveryStartupRecoveryReport, OutboundDeliveryStatus, STARTUP_RECOVERY_DIAGNOSTIC,
@@ -437,6 +438,89 @@ impl RuntimeState {
         Ok(())
     }
 
+    #[allow(
+        dead_code,
+        reason = "reserved for durable agent-run completion before orchestrator wiring"
+    )]
+    pub(super) fn complete_run_with_output_deliveries(
+        &mut self,
+        id: &RunId,
+        deliveries: Vec<OutboundDeliveryRecord>,
+        finished_at_unix: u64,
+    ) -> Result<Vec<OutboundDeliveryRecord>, String> {
+        if deliveries.is_empty() {
+            return Err(format!(
+                "agent run {id} completion must contain outbound deliveries"
+            ));
+        }
+
+        let run = self
+            .run(id)
+            .cloned()
+            .ok_or_else(|| format!("unknown run id {id}"))?;
+        if run.status() != RunStatus::Running {
+            return Err(format!("run {id} cannot complete from {:?}", run.status()));
+        }
+        if finished_at_unix < run.updated_at_unix() {
+            return Err(format!("run {id} cannot complete before updated_at_unix"));
+        }
+
+        let mut delivery_ids = BTreeSet::new();
+        for delivery in &deliveries {
+            delivery.validate()?;
+            self.validate_outbound_delivery_session(delivery)?;
+
+            if delivery.status() != OutboundDeliveryStatus::Pending {
+                return Err(format!(
+                    "agent run {id} output delivery {} must be pending",
+                    delivery.id()
+                ));
+            }
+            if delivery.session_id() != run.session_id() {
+                return Err(format!(
+                    "agent run {id} output delivery {} does not match session {}",
+                    delivery.id(),
+                    run.session_id()
+                ));
+            }
+            if delivery.message().author != MessageAuthor::Agent {
+                return Err(format!(
+                    "agent run {id} output delivery {} must contain an agent-authored message",
+                    delivery.id()
+                ));
+            }
+            if delivery.created_at_unix() != finished_at_unix {
+                return Err(format!(
+                    "agent run {id} output delivery {} created_at_unix must match completion time",
+                    delivery.id()
+                ));
+            }
+            if !delivery_ids.insert(delivery.id().clone()) {
+                return Err(format!(
+                    "agent run {id} contains duplicate output delivery id {}",
+                    delivery.id()
+                ));
+            }
+            if self.outbound_delivery(delivery.id()).is_some() {
+                return Err(format!(
+                    "agent run {id} output delivery {} already exists",
+                    delivery.id()
+                ));
+            }
+        }
+
+        let output_delivery_ids = deliveries
+            .iter()
+            .map(|delivery| delivery.id().clone())
+            .collect();
+        self.run_mut(id)?
+            .complete_with_output_deliveries(finished_at_unix, output_delivery_ids)?;
+        self.outbound_deliveries.extend(deliveries.iter().cloned());
+        self.touch_at(finished_at_unix.max(unix_seconds_now()));
+
+        Ok(deliveries)
+    }
+
     pub fn fail_run(&mut self, id: &RunId, finished_at_unix: u64) -> Result<(), String> {
         {
             let run = self.run_mut(id)?;
@@ -492,6 +576,7 @@ impl RuntimeState {
         let mut last_queued_inbound_position = None;
         let mut last_owned_enqueued_at_by_session = BTreeMap::new();
         let mut outbound_delivery_ids = BTreeSet::new();
+        let mut output_delivery_owner_by_id = BTreeMap::new();
 
         for session in &self.sessions {
             session.validate()?;
@@ -514,6 +599,17 @@ impl RuntimeState {
 
             if !run_ids.insert(run.id()) {
                 return Err(format!("duplicate run id {}", run.id()));
+            }
+
+            for delivery_id in run.output_delivery_ids() {
+                if let Some(existing_run_id) =
+                    output_delivery_owner_by_id.insert(delivery_id, run.id())
+                {
+                    return Err(format!(
+                        "outbound delivery {delivery_id} is output for multiple runs {existing_run_id} and {}",
+                        run.id()
+                    ));
+                }
             }
 
             if !run.is_terminal() {
@@ -568,6 +664,31 @@ impl RuntimeState {
                 return Err(format!(
                     "runtime state updated_at_unix before outbound delivery {} updated_at_unix",
                     delivery.id()
+                ));
+            }
+        }
+
+        for (delivery_id, run_id) in output_delivery_owner_by_id {
+            let run = self
+                .run(run_id)
+                .expect("run output ownership was collected from a validated run");
+            let delivery = self.outbound_delivery(delivery_id).ok_or_else(|| {
+                format!("completed run {run_id} references missing outbound delivery {delivery_id}")
+            })?;
+            if delivery.session_id() != run.session_id() {
+                return Err(format!(
+                    "completed run {run_id} output delivery {delivery_id} does not match session {}",
+                    run.session_id()
+                ));
+            }
+            if delivery.message().author != MessageAuthor::Agent {
+                return Err(format!(
+                    "completed run {run_id} output delivery {delivery_id} must be agent-authored"
+                ));
+            }
+            if Some(delivery.created_at_unix()) != run.finished_at_unix() {
+                return Err(format!(
+                    "completed run {run_id} output delivery {delivery_id} does not match finished_at_unix"
                 ));
             }
         }
@@ -1528,6 +1649,30 @@ mod tests {
         assert_eq!(run.status(), RunStatus::Completed);
         assert_eq!(run.started_at_unix(), Some(11));
         assert_eq!(run.finished_at_unix(), Some(12));
+    }
+    #[test]
+    fn state_json_rejects_completed_run_with_missing_linked_output() {
+        let (mut state, run_id) = state_with_pending_run("run_linked_output");
+        state.start_run(&run_id, 11).expect("run should start");
+        let session_id = state
+            .run(&run_id)
+            .expect("run should exist")
+            .session_id()
+            .clone();
+        let delivery = outbound_delivery_fixture("out_linked", session_id, 12);
+        state
+            .complete_run_with_output_deliveries(&run_id, vec![delivery], 12)
+            .expect("run and output should complete atomically");
+
+        let mut encoded = serde_json::to_value(&state).expect("state should encode");
+        encoded["outbound_deliveries"] = serde_json::json!([]);
+        let err = serde_json::from_value::<RuntimeState>(encoded)
+            .expect_err("missing linked output must fail state validation");
+
+        assert!(
+            err.to_string()
+                .contains("references missing outbound delivery")
+        );
     }
     #[test]
     fn state_transitions_can_fail_or_cancel_persisted_run_records() {

@@ -6,5 +6,6 @@ mod outbound_recovery;
 mod outbound_resolution;
 mod queue;
 mod recovery;
+mod run;
 
 pub use core::StateStore;
