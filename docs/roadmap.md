@@ -105,6 +105,7 @@ Goal: layer durable orchestration on top of the runtime foundations without addi
 - Exact-root workspace policy skeleton with typed allow/deny decisions and deny-by-default behavior
 - Principal/scope access policy skeleton with typed allow/deny decisions and an explicit administrator subset
 - Remaining `ImAdapter` capabilities and a synchronous, completion-oriented `AgentAdapter` capability boundary
+- Store-level durable agent-run transitions: persist start before handoff, atomically link successful output to the outbox with completion, durably classify definite or uncertain failures, and advance the state schema for output ownership
 - Concrete runtime orchestrator that wires storage, queues, policies, and adapter boundaries
 - Runtime-level tests that prove duplicate handling, queueing, recovery, and policy decisions
 - Pre-release runtime state schema compatibility consolidation that removes unreleased milestone-intermediate schemas before the metadata-only release PR

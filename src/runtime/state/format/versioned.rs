@@ -9,7 +9,8 @@ use super::{
     current::{
         RUNTIME_STATE_FILE_V1_VERSION, RUNTIME_STATE_FILE_V2_VERSION,
         RUNTIME_STATE_FILE_V3_VERSION, RUNTIME_STATE_FILE_V4_VERSION,
-        RUNTIME_STATE_FILE_V5_VERSION, RUNTIME_STATE_FILE_V6_VERSION, RUNTIME_STATE_FILE_VERSION,
+        RUNTIME_STATE_FILE_V5_VERSION, RUNTIME_STATE_FILE_V6_VERSION,
+        RUNTIME_STATE_FILE_V7_VERSION, RUNTIME_STATE_FILE_VERSION,
     },
     wire::WireField,
 };
@@ -76,6 +77,7 @@ pub(super) fn decode_persisted_collections(
         RUNTIME_STATE_FILE_V2_VERSION => {
             let runs = runs.into_required("runtime state version 2 must contain run records")?;
             reject_interrupted_runs(RUNTIME_STATE_FILE_V2_VERSION, &runs)?;
+            reject_output_linked_runs(RUNTIME_STATE_FILE_V2_VERSION, &runs)?;
 
             if inbound_events.is_present() {
                 return Err(
@@ -102,6 +104,7 @@ pub(super) fn decode_persisted_collections(
         RUNTIME_STATE_FILE_V3_VERSION => {
             let runs = runs.into_required("runtime state version 3 must contain run records")?;
             reject_interrupted_runs(RUNTIME_STATE_FILE_V3_VERSION, &runs)?;
+            reject_output_linked_runs(RUNTIME_STATE_FILE_V3_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 3 must contain inbound event records")?;
 
@@ -131,6 +134,7 @@ pub(super) fn decode_persisted_collections(
         RUNTIME_STATE_FILE_V4_VERSION => {
             let runs = runs.into_required("runtime state version 4 must contain run records")?;
             reject_interrupted_runs(RUNTIME_STATE_FILE_V4_VERSION, &runs)?;
+            reject_output_linked_runs(RUNTIME_STATE_FILE_V4_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 4 must contain inbound event records")?;
             let outbound_deliveries = outbound_deliveries
@@ -156,6 +160,7 @@ pub(super) fn decode_persisted_collections(
         RUNTIME_STATE_FILE_V5_VERSION => {
             let runs = runs.into_required("runtime state version 5 must contain run records")?;
             reject_interrupted_runs(RUNTIME_STATE_FILE_V5_VERSION, &runs)?;
+            reject_output_linked_runs(RUNTIME_STATE_FILE_V5_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 5 must contain inbound event records")?;
             let queued_messages = queued_messages
@@ -179,6 +184,7 @@ pub(super) fn decode_persisted_collections(
         RUNTIME_STATE_FILE_V6_VERSION => {
             let runs = runs.into_required("runtime state version 6 must contain run records")?;
             reject_interrupted_runs(RUNTIME_STATE_FILE_V6_VERSION, &runs)?;
+            reject_output_linked_runs(RUNTIME_STATE_FILE_V6_VERSION, &runs)?;
             let inbound_events = inbound_events
                 .into_required("runtime state version 6 must contain inbound event records")?;
             let outbound_deliveries = outbound_deliveries
@@ -187,6 +193,27 @@ pub(super) fn decode_persisted_collections(
                 .into_required("runtime state version 6 must contain queued messages")?;
             let run_inputs =
                 run_inputs.into_required("runtime state version 6 must contain run inputs")?;
+
+            (
+                runs,
+                run_inputs,
+                inbound_events,
+                queued_messages,
+                outbound_deliveries,
+                false,
+            )
+        }
+        RUNTIME_STATE_FILE_V7_VERSION => {
+            let runs = runs.into_required("runtime state version 7 must contain run records")?;
+            reject_output_linked_runs(RUNTIME_STATE_FILE_V7_VERSION, &runs)?;
+            let inbound_events = inbound_events
+                .into_required("runtime state version 7 must contain inbound event records")?;
+            let outbound_deliveries = outbound_deliveries
+                .into_required("runtime state version 7 must contain outbound deliveries")?;
+            let queued_messages = queued_messages
+                .into_required("runtime state version 7 must contain queued messages")?;
+            let run_inputs =
+                run_inputs.into_required("runtime state version 7 must contain run inputs")?;
 
             (
                 runs,
@@ -254,6 +281,16 @@ fn reject_interrupted_runs(version: u32, runs: &[RunRecord]) -> Result<(), Strin
     Ok(())
 }
 
+fn reject_output_linked_runs(version: u32, runs: &[RunRecord]) -> Result<(), String> {
+    if runs.iter().any(|run| !run.output_delivery_ids().is_empty()) {
+        return Err(format!(
+            "runtime state version {version} must not contain run output delivery ids"
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -262,6 +299,8 @@ mod tests {
     };
 
     use crate::runtime::{
+        message::{Message, MessageAuthor, MessageContent, MessageId},
+        outbox::{OutboundDeliveryId, OutboundDeliveryRecord},
         run::{RunId, RunRecord},
         session::{Session, SessionScope},
         state::StateStore,
@@ -683,12 +722,100 @@ mod tests {
         assert!(err.contains("version 6 must not contain interrupted runs"));
     }
     #[test]
+    fn state_load_migrates_version_7_without_output_delivery_links() {
+        let path = test_path("state-v7-without-output-links").join("runtime.state.json");
+        let session =
+            Session::new(SessionScope::new("lark", "chat:v7").expect("valid session scope"));
+        let run_id = RunId::new("run_v7").expect("valid run id");
+        let mut state = crate::runtime::state::RuntimeState::new();
+        state.upsert_session(session.clone());
+        state
+            .add_run(RunRecord::new(run_id.clone(), session.id().clone(), 10))
+            .expect("version 7 pending run should be valid");
+        let mut encoded = serde_json::to_value(&state).expect("version 7 state should encode");
+        encoded["version"] = serde_json::json!(7);
+        encoded["runs"][0]
+            .as_object_mut()
+            .expect("run should be an object")
+            .remove("output_delivery_ids");
+        fs::write(
+            &path,
+            serde_json::to_vec(&encoded).expect("version 7 fixture should encode"),
+        )
+        .expect("state fixture should write");
+        let store = StateStore::new(&path);
+
+        let state = store
+            .load()
+            .expect("version 7 state should migrate without output links");
+        assert!(
+            state
+                .run(&run_id)
+                .expect("migrated run should remain present")
+                .output_delivery_ids()
+                .is_empty()
+        );
+        store.save(&state).expect("migrated state should save");
+        let encoded: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).expect("migrated state should remain readable"),
+        )
+        .expect("migrated state should decode");
+
+        assert_eq!(
+            encoded["version"].as_u64(),
+            Some(u64::from(super::RUNTIME_STATE_FILE_VERSION))
+        );
+        assert!(encoded["runs"][0].get("output_delivery_ids").is_some());
+    }
+    #[test]
+    fn state_load_rejects_output_delivery_links_in_version_7() {
+        let path = test_path("state-v7-with-output-links").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session =
+            Session::new(SessionScope::new("lark", "chat:output").expect("valid session scope"));
+        let run_id = RunId::new("run_1").expect("valid run id");
+        let delivery_id = OutboundDeliveryId::new("out_1").expect("valid delivery id");
+        let message = Message::new(
+            MessageId::new("msg_1").expect("valid message id"),
+            Some(session.id().clone()),
+            MessageAuthor::Agent,
+            MessageContent::text("done").expect("valid content"),
+            12,
+        );
+        let delivery =
+            OutboundDeliveryRecord::new(delivery_id.clone(), session.id().clone(), message, 12)
+                .expect("valid delivery");
+        let mut run = RunRecord::new(run_id, session.id().clone(), 10);
+        run.start(11).expect("run should start");
+        run.complete_with_output_deliveries(12, vec![delivery_id])
+            .expect("run should complete with output ownership");
+        let mut state = crate::runtime::state::RuntimeState::new();
+        state.upsert_session(session);
+        state.add_run(run).expect("completed run should be valid");
+        state
+            .enqueue_outbound_delivery(delivery)
+            .expect("linked output should enqueue");
+        let mut encoded = serde_json::to_value(&state).expect("current state should encode");
+        encoded["version"] = serde_json::json!(7);
+        fs::write(
+            &path,
+            serde_json::to_vec(&encoded).expect("version 7 fixture should encode"),
+        )
+        .expect("version 7 fixture should write");
+
+        let err = store
+            .load()
+            .expect_err("version 7 must not accept output delivery links");
+
+        assert!(err.contains("version 7 must not contain run output delivery ids"));
+    }
+    #[test]
     fn state_load_rejects_future_file_version() {
         let path = test_path("state-future-version").join("runtime.state.json");
         fs::write(
             &path,
             r#"{
-            "version": 8,
+            "version": 9,
             "sessions": [],
             "runs": [],
             "inbound_events": [],
@@ -703,7 +830,7 @@ mod tests {
             .load()
             .expect_err("future state versions must not be loaded");
 
-        assert!(err.contains("unsupported runtime state version 8; expected 7"));
+        assert!(err.contains("unsupported runtime state version 9; expected 8"));
     }
     #[test]
     fn state_load_rejects_current_version_without_run_records() {

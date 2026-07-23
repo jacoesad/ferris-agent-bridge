@@ -14,13 +14,14 @@ use super::{
     wire::{WireField, deserialize_wire_field},
 };
 
-pub const RUNTIME_STATE_FILE_VERSION: u32 = 7;
+pub const RUNTIME_STATE_FILE_VERSION: u32 = 8;
 pub(super) const RUNTIME_STATE_FILE_V1_VERSION: u32 = 1;
 pub(super) const RUNTIME_STATE_FILE_V2_VERSION: u32 = 2;
 pub(super) const RUNTIME_STATE_FILE_V3_VERSION: u32 = 3;
 pub(super) const RUNTIME_STATE_FILE_V4_VERSION: u32 = 4;
 pub(super) const RUNTIME_STATE_FILE_V5_VERSION: u32 = 5;
 pub(super) const RUNTIME_STATE_FILE_V6_VERSION: u32 = 6;
+pub(super) const RUNTIME_STATE_FILE_V7_VERSION: u32 = 7;
 
 pub(in crate::runtime::state) fn state_file_from_state(
     state: &RuntimeState,
@@ -32,9 +33,33 @@ pub(in crate::runtime::state) fn parse_state_file(
     input: &str,
 ) -> Result<RuntimeState, serde_json::Error> {
     let state_file: RuntimeStateFileWire = serde_json::from_str(input)?;
+    if state_file.version == RUNTIME_STATE_FILE_VERSION {
+        let shape: serde_json::Value = serde_json::from_str(input)?;
+        require_current_run_output_fields(&shape)
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    }
     state_file
         .into_state()
         .map_err(<serde_json::Error as serde::de::Error>::custom)
+}
+
+fn require_current_run_output_fields(shape: &serde_json::Value) -> Result<(), String> {
+    let Some(runs) = shape.get("runs").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+
+    for (index, run) in runs.iter().enumerate() {
+        let Some(run) = run.as_object() else {
+            continue;
+        };
+        if !run.contains_key("output_delivery_ids") {
+            return Err(format!(
+                "runtime state version {RUNTIME_STATE_FILE_VERSION} run at index {index} must contain output_delivery_ids"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -145,6 +170,43 @@ mod tests {
         assert!(encoded.get("inbound_events").is_some());
         assert!(encoded.get("queued_messages").is_some());
         assert!(encoded.get("outbound_deliveries").is_some());
+    }
+    #[test]
+    fn state_load_rejects_current_run_without_output_delivery_ids_field() {
+        let path = test_path("state-current-run-missing-output-field").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(
+            SessionScope::new("lark", "chat:missing-output-field").expect("valid scope"),
+        );
+        let mut state = RuntimeState::new();
+        state.upsert_session(session.clone());
+        state
+            .add_run(RunRecord::new(
+                RunId::new("run_1").expect("valid run id"),
+                session.id().clone(),
+                10,
+            ))
+            .expect("pending run should be accepted");
+        store.save(&state).expect("current state should save");
+
+        let mut encoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("current state file should read"))
+                .expect("current state file should decode");
+        encoded["runs"][0]
+            .as_object_mut()
+            .expect("run should be an object")
+            .remove("output_delivery_ids");
+        fs::write(
+            &path,
+            serde_json::to_vec(&encoded).expect("invalid current state should encode"),
+        )
+        .expect("invalid current state fixture should write");
+
+        let err = store
+            .load()
+            .expect_err("current state must require explicit output ownership field");
+
+        assert!(err.contains("must contain output_delivery_ids"));
     }
     #[test]
     fn state_load_rejects_stale_state_updated_at_for_sessions() {
@@ -900,7 +962,10 @@ mod tests {
             .load()
             .expect_err("run input history must retain session claim order");
 
-        assert!(err.contains("out of session ownership order"));
+        assert!(
+            err.contains("out of session ownership order"),
+            "unexpected validation error: {err}"
+        );
     }
     #[test]
     fn state_validation_rejects_duplicate_outbound_delivery_ids() {

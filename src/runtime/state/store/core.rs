@@ -4,7 +4,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use crate::runtime::{outbox::OutboundDeliveryStatus, persistence::write_json_atomic};
+use crate::runtime::{
+    outbox::OutboundDeliveryStatus, persistence::write_json_atomic, run::RunStatus,
+};
 
 use super::{
     super::{
@@ -67,6 +69,8 @@ impl StateStore {
         let existing = self.load_existing_for_merge()?;
         validate_snapshot_outbound_additions(&state, existing.as_ref())?;
         validate_snapshot_run_input_additions(&state, existing.as_ref())?;
+        validate_snapshot_agent_run_transitions(&state, existing.as_ref())?;
+        validate_snapshot_run_output_additions(&state, existing.as_ref())?;
 
         if let Some(existing) = existing {
             state.validate_shared_inbound_event_identity(&existing)?;
@@ -161,6 +165,63 @@ fn validate_snapshot_run_input_additions(
     Ok(())
 }
 
+fn validate_snapshot_run_output_additions(
+    candidate: &RuntimeState,
+    existing: Option<&RuntimeState>,
+) -> Result<(), String> {
+    for run in candidate.runs() {
+        if run.output_delivery_ids().is_empty() {
+            continue;
+        }
+
+        let existing_output_ids = existing
+            .and_then(|state| state.run(run.id()))
+            .map(|existing_run| existing_run.output_delivery_ids());
+        if existing_output_ids != Some(run.output_delivery_ids()) {
+            return Err(format!(
+                "runtime state save cannot introduce or change output delivery ownership for run {}; agent output must be committed through the StateStore agent-run completion transition",
+                run.id()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_snapshot_agent_run_transitions(
+    candidate: &RuntimeState,
+    existing: Option<&RuntimeState>,
+) -> Result<(), String> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+
+    for candidate_run in candidate.runs() {
+        if existing.run_input(candidate_run.id()).is_none() {
+            continue;
+        }
+
+        let existing_run = existing
+            .run(candidate_run.id())
+            .expect("validated run input must reference an existing run");
+        if candidate_run == existing_run || existing_run.is_descendant_of(candidate_run) {
+            continue;
+        }
+
+        if matches!(
+            candidate_run.status(),
+            RunStatus::Running | RunStatus::Completed
+        ) {
+            return Err(format!(
+                "runtime state save cannot create a handoff or completion for durable agent run {}; use the StateStore agent-run transition",
+                candidate_run.id()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -226,6 +287,49 @@ mod tests {
             RunStatus::Completed
         );
         assert_eq!(loaded, state);
+    }
+    #[test]
+    fn state_store_snapshot_cannot_introduce_agent_run_output_ownership() {
+        let path = test_path("state-snapshot-run-output").join("runtime.state.json");
+        let store = StateStore::new(&path);
+        let session = Session::new(SessionScope::new("lark", "chat:oc_123").expect("valid scope"));
+        let run_id = RunId::new("run_1").expect("valid run id");
+        let delivery_id = OutboundDeliveryId::new("out_1").expect("valid delivery id");
+        let message = Message::new(
+            MessageId::new("msg_1").expect("valid message id"),
+            Some(session.id().clone()),
+            MessageAuthor::Agent,
+            MessageContent::text("done").expect("valid content"),
+            12,
+        );
+        let delivery =
+            OutboundDeliveryRecord::new(delivery_id.clone(), session.id().clone(), message, 12)
+                .expect("valid delivery");
+        let mut run = RunRecord::new(run_id, session.id().clone(), 10);
+        run.start(11).expect("run should start");
+        run.complete_with_output_deliveries(12, vec![delivery_id])
+            .expect("candidate run should complete");
+        let mut candidate = RuntimeState::new();
+        candidate.upsert_session(session);
+        candidate
+            .add_run(run)
+            .expect("candidate run should be accepted");
+        candidate
+            .enqueue_outbound_delivery(delivery)
+            .expect("candidate output should be internally valid");
+
+        let err = store
+            .save(&candidate)
+            .expect_err("snapshot save must not introduce agent output ownership");
+
+        assert!(err.contains("cannot introduce or change output delivery ownership"));
+        assert!(
+            store
+                .load()
+                .expect("state should remain readable")
+                .runs()
+                .is_empty()
+        );
     }
     #[test]
     fn state_store_preserves_newer_run_transitions_from_stale_saves() {

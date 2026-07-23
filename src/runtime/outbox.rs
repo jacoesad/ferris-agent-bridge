@@ -194,6 +194,17 @@ impl OutboundDeliveryRecord {
         self.last_error.as_deref()
     }
 
+    #[allow(
+        dead_code,
+        reason = "reserved for durable agent-run completion before orchestrator wiring"
+    )]
+    pub(crate) fn has_same_enqueue_identity(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.session_id == other.session_id
+            && self.message == other.message
+            && self.created_at_unix == other.created_at_unix
+    }
+
     pub fn begin_delivery(&mut self, started_at_unix: u64) -> Result<(), String> {
         if !matches!(
             self.status,

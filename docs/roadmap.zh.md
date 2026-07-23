@@ -105,6 +105,7 @@ Milestone 0 完成标准是：仓库具备足够结构，可以通过聚焦 foll
 - Exact-root workspace policy skeleton，提供 typed allow/deny decision，并默认拒绝
 - Principal/scope access policy skeleton，提供 typed allow/deny decision 和显式 administrator subset
 - 剩余 `ImAdapter` 能力和 synchronous、completion-oriented 的 `AgentAdapter` capability boundary
+- Store-level durable agent-run transitions：在 handoff 前持久化 start，将 successful output 与 outbox 及 completion 原子关联，持久化区分 definite 或 uncertain failure，并为 output ownership 升级 state schema
 - 具体 runtime orchestrator，用于串联 storage、queues、policies 和 adapter boundaries
 - Runtime-level tests，证明 duplicate handling、queueing、recovery 和 policy decisions
 - Release 前的 runtime state schema compatibility consolidation：在只包含 metadata 的 release PR 前移除 milestone 开发期未发布的中间 schema
